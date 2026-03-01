@@ -110,6 +110,15 @@ func (p *SRTPProxy) OpenPorts(videoPort, audioPort int) (int, int, error) {
 		return 0, 0, fmt.Errorf("listen audio UDP: %w", err)
 	}
 
+	// Increase socket read buffers to survive RTP bursts (e.g. large IDR frames).
+	// If the kernel's rmem_max is too low, the actual buffer may be smaller.
+	if err := p.videoConn.SetReadBuffer(2 * 1024 * 1024); err != nil {
+		p.logger.Warn("failed to set video UDP read buffer (check net.core.rmem_max)", "error", err)
+	}
+	if err := p.audioConn.SetReadBuffer(512 * 1024); err != nil {
+		p.logger.Warn("failed to set audio UDP read buffer (check net.core.rmem_max)", "error", err)
+	}
+
 	actualVideoPort := p.videoConn.LocalAddr().(*net.UDPAddr).Port
 	actualAudioPort := p.audioConn.LocalAddr().(*net.UDPAddr).Port
 
@@ -191,11 +200,16 @@ func (p *SRTPProxy) Start(cfg SRTPConfig) error {
 }
 
 // readVideoLoop reads raw UDP packets from the video port, demuxes RTP vs RTCP,
-// and handles each appropriately.
+// and handles each appropriately. Packets are buffered per-frame and only
+// forwarded as complete frames to prevent partial-frame decoder artifacts.
 func (p *SRTPProxy) readVideoLoop() {
 	defer p.wg.Done()
 	buf := make([]byte, 2048)
-	var videoCount, rtcpCount uint64
+	var videoCount, rtcpCount, dropCount, decryptErrors, droppedFrames uint64
+	var lastSeq uint16
+	var lastFrameTS uint32
+	var frameGapped bool          // true if current frame has a sequence gap
+	var frameBuf []*rtp.Packet    // buffered packets for current frame
 	lastLogTime := time.Now()
 
 	for {
@@ -228,9 +242,11 @@ func (p *SRTPProxy) readVideoLoop() {
 		header := &rtp.Header{}
 		decrypted, err := p.videoDecryptCtx.DecryptRTP(nil, buf[:n], header)
 		if err != nil {
-			if videoCount == 0 {
-				p.logger.Warn("video SRTP decrypt error (first packet)",
-					"error", err, "size", n, "pt_byte", pt)
+			decryptErrors++
+			if decryptErrors <= 3 || decryptErrors%100 == 0 {
+				p.logger.Warn("video SRTP decrypt error",
+					"error", err, "size", n, "pt_byte", pt,
+					"total_errors", decryptErrors)
 			}
 			continue
 		}
@@ -246,15 +262,77 @@ func (p *SRTPProxy) readVideoLoop() {
 		// Track camera's actual SSRC and highest seq.
 		if videoCount == 1 {
 			p.cameraVideoSSRC = pkt.Header.SSRC
+			lastFrameTS = pkt.Header.Timestamp
 			p.logger.Info("first video RTP packet received",
 				"pt", pkt.Header.PayloadType,
 				"ssrc", pkt.Header.SSRC,
 				"seq", pkt.Header.SequenceNumber,
 				"size", n)
+		} else {
+			// Detect RTP sequence gaps (dropped UDP packets).
+			expected := lastSeq + 1
+			if pkt.Header.SequenceNumber != expected {
+				gap := int(pkt.Header.SequenceNumber) - int(expected)
+				if gap < 0 {
+					gap += 65536
+				}
+				dropCount += uint64(gap)
+				frameGapped = true
+				p.logger.Warn("video RTP sequence gap",
+					"expected", expected,
+					"got", pkt.Header.SequenceNumber,
+					"gap", gap,
+					"total_drops", dropCount)
+			}
 		}
+		lastSeq = pkt.Header.SequenceNumber
 		seq32 := uint32(pkt.Header.SequenceNumber)
 		if seq32 > p.highestVideoSeq || videoCount == 1 {
 			p.highestVideoSeq = seq32
+		}
+
+		// Frame boundary: new RTP timestamp means new frame.
+		// Flush previous frame buffer (forward if complete, drop if gapped).
+		if pkt.Header.Timestamp != lastFrameTS && len(frameBuf) > 0 {
+			if !frameGapped && p.onVideoRTP != nil {
+				for _, fp := range frameBuf {
+					p.onVideoRTP(fp)
+				}
+			} else if frameGapped {
+				droppedFrames++
+			}
+			frameBuf = frameBuf[:0]
+
+			// If the gap crossed into this new frame (first packet isn't
+			// a frame start), carry the gapped flag forward.
+			if frameGapped {
+				frameGapped = len(pkt.Payload) > 0 && !isFrameStart(pkt.Payload)
+			}
+		}
+		lastFrameTS = pkt.Header.Timestamp
+
+		// Safety cap: if buffer grows too large (e.g. missing marker packets),
+		// drop and reset.
+		if len(frameBuf) >= 300 {
+			p.logger.Warn("frame buffer overflow, dropping", "buffered", len(frameBuf))
+			frameBuf = frameBuf[:0]
+			frameGapped = true
+		}
+
+		// Buffer the packet.
+		frameBuf = append(frameBuf, pkt)
+
+		// End of frame (marker bit): flush the complete frame.
+		if pkt.Header.Marker {
+			if !frameGapped && p.onVideoRTP != nil {
+				for _, fp := range frameBuf {
+					p.onVideoRTP(fp)
+				}
+			} else if frameGapped {
+				droppedFrames++
+			}
+			frameBuf = frameBuf[:0]
+			frameGapped = false
 		}
 
 		// Log every second to track camera packet rate.
@@ -262,15 +340,33 @@ func (p *SRTPProxy) readVideoLoop() {
 			p.logger.Info("video RTP stats",
 				"total_packets", videoCount,
 				"rtcp_packets", rtcpCount,
+				"drops", dropCount,
+				"dropped_frames", droppedFrames,
+				"decrypt_errors", decryptErrors,
 				"seq", pkt.Header.SequenceNumber,
 				"ts", pkt.Header.Timestamp)
 			lastLogTime = time.Now()
 		}
-
-		if p.onVideoRTP != nil {
-			p.onVideoRTP(pkt)
-		}
 	}
+}
+
+// isFrameStart checks if an RTP payload begins a new H.264 access unit.
+// Returns true for: single NALUs (types 1-23), STAP-A (type 24),
+// or FU-A (type 28) with the start bit set.
+func isFrameStart(payload []byte) bool {
+	if len(payload) < 1 {
+		return false
+	}
+	naluType := payload[0] & 0x1F
+	switch {
+	case naluType >= 1 && naluType <= 24:
+		// Single NALU or STAP-A — always a frame/AU start.
+		return true
+	case naluType == 28 && len(payload) > 1:
+		// FU-A: only a frame start if the start bit is set.
+		return payload[1]&0x80 != 0
+	}
+	return false
 }
 
 // handleVideoRTCP processes an SRTCP packet received from the camera on the

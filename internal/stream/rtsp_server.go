@@ -35,18 +35,17 @@ type RTSPServer struct {
 	videoCount   uint64
 	gotParams   bool // true once SPS/PPS have been extracted
 
-	// RTP sequence/timestamp normalization: the camera uses its own seq/timestamp
-	// values that change on each stream restart. We remap these to continuous
-	// values so gortsplib's RTP-Info header matches the actual packets.
-	// Protected by rtpMu (accessed by camera write goroutine AND IDR injector).
-	rtpMu          sync.Mutex
+	// videoWriteMu serializes all video writes (normal + IDR injection) to
+	// prevent interleaving. Covers seq/ts assignment through WritePacketRTP.
+	// Also protects videoSeq, videoSeqInited, videoTSBase, videoTSOffset,
+	// lastVideoTS, lastVideoTime.
+	videoWriteMu   sync.Mutex
 	videoSeq       uint16    // monotonic output sequence counter
 	videoSeqInited bool      // true after first video packet in current camera session
 	videoTSBase    uint32    // camera's starting timestamp for current session
 	videoTSOffset  uint32    // our timestamp offset (accumulated from previous sessions)
 	lastVideoTS    uint32    // last real camera packet's output timestamp
 	lastVideoTime  time.Time // wall-clock time of last video packet
-	maxWrittenTS   uint32    // highest timestamp ever written (including IDR injection)
 
 	// IDR frame cache: the camera only sends SPS/PPS + IDR at stream start,
 	// so we cache those packets and replay them for late-joining clients.
@@ -55,10 +54,6 @@ type RTSPServer struct {
 	idrPending    []*rtp.Packet // IDR being collected (not yet complete)
 	idrReady      chan struct{} // closed when first IDR is cached
 	collectingIDR bool          // true while collecting IDR FU-A fragments
-
-	// Periodic IDR injection: ffmpeg's probe phase (~5s) consumes the initial
-	// IDR, so we periodically re-inject it with fresh seq/ts numbers.
-	stopIDRInjector chan struct{}
 
 	// Audio transcoder: AAC-ELD → AAC-LC (nil if audio disabled or non-ELD codec).
 	transcoder *AudioTranscoder
@@ -178,7 +173,7 @@ func (s *RTSPServer) Start() error {
 	s.server = &gortsplib.Server{
 		Handler:        s,
 		RTSPAddress:    fmt.Sprintf(":%d", s.port),
-		WriteQueueSize: 512,
+		WriteQueueSize: 2048,
 		WriteTimeout:   30 * time.Second, // survive ffmpeg's 5s probe phase
 	}
 
@@ -262,81 +257,12 @@ func (s *RTSPServer) cacheIDRPacket(pkt *rtp.Packet) {
 	}
 }
 
-// injectCachedIDR sends the cached IDR frame with FRESH sequence numbers and
-// timestamps so that it appears as a normal part of the ongoing RTP stream.
-// The cached packets have stale seq/ts from when they were originally sent;
-// we clone them and assign current values so clients (especially ffmpeg) don't
-// see backwards seq numbers.
-func (s *RTSPServer) injectCachedIDR() {
-	s.idrMu.Lock()
-	cache := s.idrCache
-	s.idrMu.Unlock()
-
-	if len(cache) == 0 {
-		return
-	}
-
-	s.mu.Lock()
-	stream := s.stream
-	s.mu.Unlock()
-	if stream == nil {
-		return
-	}
-
-	// Build all packets with fresh seq/ts under the lock, then send them
-	// after releasing it. This avoids holding rtpMu while WritePacketRTP
-	// potentially blocks on the ring buffer.
-	s.rtpMu.Lock()
-
-	// Estimate the current stream timestamp based on wall-clock time elapsed
-	// since the last real camera packet. This keeps injected IDR timestamps
-	// in line with where the camera's timestamps are, preventing non-monotonic
-	// DTS when real packets arrive immediately after injection.
-	elapsed := time.Since(s.lastVideoTime)
-	idrTS := s.lastVideoTS + uint32(elapsed.Seconds()*90000)
-	if idrTS <= s.lastVideoTS {
-		idrTS = s.lastVideoTS + 1 // ensure forward progress
-	}
-
-	packets := make([]*rtp.Packet, len(cache))
-	for i, cached := range cache {
-		pkt := clonePacket(cached)
-		pkt.Header.SequenceNumber = s.videoSeq
-		s.videoSeq++
-		pkt.Header.Timestamp = idrTS
-		pkt.Header.PayloadType = s.videoFormat.PayloadType()
-		packets[i] = pkt
-	}
-	// Don't update lastVideoTS here — let real camera packets drive it.
-	// But DO update maxWrittenTS so subsequent real packets are clamped to
-	// be >= this IDR's timestamp, preventing non-monotonic DTS.
-	s.maxWrittenTS = idrTS
-
-	s.logger.Info("injecting cached IDR with fresh seq/ts",
-		"packets", len(packets), "startSeq", packets[0].Header.SequenceNumber, "ts", idrTS)
-	s.rtpMu.Unlock()
-
-	// Send outside the lock — WritePacketRTP may block on the ring buffer.
-	for _, pkt := range packets {
-		stream.WritePacketRTP(s.medias[0], pkt)
-	}
-}
-
 // ResetVideoRTP must be called when a new camera stream session starts.
 // It adjusts the timestamp offset to account for wall-clock time elapsed since
 // the last packet, keeping gortsplib's RTP-Info prediction aligned.
 // It also clears the IDR cache since those packets have stale timestamps.
 func (s *RTSPServer) ResetVideoRTP() {
-	// Stop periodic IDR injector from previous session first, so it
-	// doesn't race with the state reset below.
-	s.mu.Lock()
-	if s.stopIDRInjector != nil {
-		close(s.stopIDRInjector)
-		s.stopIDRInjector = nil
-	}
-	s.mu.Unlock()
-
-	s.rtpMu.Lock()
+	s.videoWriteMu.Lock()
 	if s.videoSeqInited {
 		elapsed := time.Since(s.lastVideoTime)
 		gap := uint32(elapsed.Seconds() * 90000)
@@ -344,10 +270,9 @@ func (s *RTSPServer) ResetVideoRTP() {
 			gap = 4500
 		}
 		s.videoTSOffset = s.lastVideoTS + gap
-		s.maxWrittenTS = s.videoTSOffset
 	}
 	s.videoSeqInited = false
-	s.rtpMu.Unlock()
+	s.videoWriteMu.Unlock()
 
 	// Clear stale IDR cache — the camera will send a fresh IDR on the new session.
 	s.idrMu.Lock()
@@ -364,7 +289,7 @@ func (s *RTSPServer) ResetVideoRTP() {
 // normalizeVideoRTP remaps the camera's seq/timestamp to continuous output values.
 // Sequence numbers use a simple monotonic counter. Timestamps are offset-based
 // to remain continuous across camera restarts.
-// Caller must hold s.rtpMu.
+// Caller must hold s.videoWriteMu.
 func (s *RTSPServer) normalizeVideoRTP(pkt *rtp.Packet) {
 	cameraTS := pkt.Header.Timestamp
 
@@ -383,14 +308,7 @@ func (s *RTSPServer) normalizeVideoRTP(pkt *rtp.Packet) {
 	// Timestamp: offset + (camera_ts - camera_base)
 	pkt.Header.Timestamp = s.videoTSOffset + (cameraTS - s.videoTSBase)
 
-	// Enforce monotonic timestamps. IDR injection may have advanced maxWrittenTS
-	// ahead of where the real camera stream is, so clamp to avoid going backwards.
-	if pkt.Header.Timestamp < s.maxWrittenTS {
-		pkt.Header.Timestamp = s.maxWrittenTS
-	}
-
 	s.lastVideoTS = pkt.Header.Timestamp
-	s.maxWrittenTS = pkt.Header.Timestamp
 	s.lastVideoTime = time.Now()
 }
 
@@ -412,12 +330,15 @@ func (s *RTSPServer) WriteVideoPacket(pkt *rtp.Packet) {
 		s.extractSPSPPS(pkt.Payload)
 	}
 
-	// Normalize seq/timestamp to continuous values (holds rtpMu).
-	s.rtpMu.Lock()
+	// Hold videoWriteMu for normalize + cache + write to prevent interleaving
+	// with IDR injection. WritePacketRTP is non-blocking (pushes to per-client
+	// ring buffers), so holding the mutex through the write is safe.
+	s.videoWriteMu.Lock()
+
 	s.normalizeVideoRTP(pkt)
-	s.rtpMu.Unlock()
 
 	// Cache IDR frame packets for late-joining clients (after normalization).
+	// cacheIDRPacket acquires idrMu internally.
 	s.cacheIDRPacket(pkt)
 
 	s.videoCount++
@@ -434,6 +355,8 @@ func (s *RTSPServer) WriteVideoPacket(pkt *rtp.Packet) {
 	if err := stream.WritePacketRTP(s.medias[0], pkt); err != nil {
 		s.logger.Warn("WritePacketRTP error", "count", s.videoCount, "seq", pkt.Header.SequenceNumber, "error", err)
 	}
+
+	s.videoWriteMu.Unlock()
 }
 
 // extractSPSPPS parses H.264 RTP payloads to find SPS (NALU type 7)
@@ -566,11 +489,6 @@ func (s *RTSPServer) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.stopIDRInjector != nil {
-		close(s.stopIDRInjector)
-		s.stopIDRInjector = nil
-	}
-
 	if s.transcoder != nil {
 		s.transcoder.Close()
 		s.transcoder = nil
@@ -606,15 +524,8 @@ func (s *RTSPServer) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseCt
 		s.logger.Error("session client disconnected error", "error", err)
 	}
 
-	// Stop IDR injector when the last client disconnects and the stream stops.
 	if s.session.State() == StateIdle {
-		s.mu.Lock()
-		if s.stopIDRInjector != nil {
-			close(s.stopIDRInjector)
-			s.stopIDRInjector = nil
-			s.logger.Info("IDR injector stopped (no more clients)")
-		}
-		s.mu.Unlock()
+		s.logger.Info("stream idle (no more clients)")
 	}
 }
 
@@ -665,12 +576,35 @@ func (s *RTSPServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respon
 			return
 		}
 
-		// Start periodic IDR injection. ffmpeg's probe phase (~5s) consumes
-		// the initial IDR, and its stream-copy muxer silently discards all
-		// packets until it sees a keyframe. By periodically injecting the
-		// cached IDR with fresh seq/ts, we guarantee a keyframe arrives after
-		// any client's probe phase completes.
-		s.startIDRInjector()
+		// Inject cached IDR so the client can start decoding immediately.
+		// WritePacketRTP is non-blocking (queues to ring buffer), so holding
+		// videoWriteMu for the batch takes <1ms and doesn't block the read loop.
+		s.mu.Lock()
+		stream := s.stream
+		s.mu.Unlock()
+		if stream == nil {
+			return
+		}
+
+		s.videoWriteMu.Lock()
+		s.idrMu.Lock()
+		cache := s.idrCache
+		s.idrMu.Unlock()
+		if len(cache) > 0 {
+			idrTS := s.lastVideoTS + 1
+			startSeq := s.videoSeq
+			for _, cached := range cache {
+				clone := clonePacket(cached)
+				clone.Header.SequenceNumber = s.videoSeq
+				s.videoSeq++
+				clone.Header.Timestamp = idrTS
+				clone.Header.PayloadType = s.videoFormat.PayloadType()
+				stream.WritePacketRTP(s.medias[0], clone)
+			}
+			s.logger.Info("IDR injected for client",
+				"packets", len(cache), "startSeq", startSeq, "ts", idrTS)
+		}
+		s.videoWriteMu.Unlock()
 	}()
 
 	return &base.Response{
@@ -681,40 +615,4 @@ func (s *RTSPServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respon
 	}, nil
 }
 
-// startIDRInjector starts a goroutine that periodically injects the cached
-// IDR frame with fresh seq/ts values. This ensures clients that need a
-// keyframe after their probe phase (like ffmpeg -c copy) will receive one.
-func (s *RTSPServer) startIDRInjector() {
-	s.mu.Lock()
-	// Stop any existing injector.
-	if s.stopIDRInjector != nil {
-		close(s.stopIDRInjector)
-	}
-	s.stopIDRInjector = make(chan struct{})
-	stop := s.stopIDRInjector
-	s.mu.Unlock()
 
-	go func() {
-		// Inject immediately for late-joining clients (2nd+ client).
-		time.Sleep(50 * time.Millisecond)
-		s.injectCachedIDR()
-
-		ticker := time.NewTicker(4 * time.Second)
-		defer ticker.Stop()
-
-		remaining := 2 // 2 more after initial (covers ~8s probe phase)
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				s.injectCachedIDR()
-				remaining--
-				if remaining <= 0 {
-					s.logger.Info("IDR injector finished (probe phase covered)")
-					return
-				}
-			}
-		}
-	}()
-}
