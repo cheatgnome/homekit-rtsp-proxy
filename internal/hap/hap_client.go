@@ -41,6 +41,11 @@ type readResult struct {
 	err  error
 }
 
+// Done returns a channel that is closed when the underlying connection dies.
+func (c *HAPClient) Done() <-chan struct{} {
+	return c.done
+}
+
 // NewHAPClient creates a client for encrypted HAP communication.
 func NewHAPClient(enc *EncryptedConn) *HAPClient {
 	c := &HAPClient{

@@ -51,12 +51,14 @@ type Controller struct {
 	bindAddr   string
 	storePath  string // path to hkontroller file store
 
-	mu         sync.Mutex
-	devices    map[string]*hkontroller.Device
-	verified   map[string]*VerifiedConn // our custom verified connections
-	charIDs    map[string]*cameraCharIDs
-	controller *hkontroller.Controller
-	cancelFunc context.CancelFunc
+	mu              sync.Mutex
+	devices         map[string]*hkontroller.Device
+	verified        map[string]*VerifiedConn // our custom verified connections
+	charIDs         map[string]*cameraCharIDs
+	motionCallbacks map[string]func(bool) // stored for re-subscribe after reconnect
+	motionCtx       context.Context       // context for motion subscriptions
+	controller      *hkontroller.Controller
+	cancelFunc      context.CancelFunc
 }
 
 // NewController creates a new HAP controller.
@@ -65,10 +67,11 @@ func NewController(store *PairingStore, bindAddr string, logger *slog.Logger) *C
 		store:     store,
 		logger:    logger,
 		bindAddr:  bindAddr,
-		storePath: "./.hkontroller",
-		devices:   make(map[string]*hkontroller.Device),
-		verified:  make(map[string]*VerifiedConn),
-		charIDs:   make(map[string]*cameraCharIDs),
+		storePath:       "./.hkontroller",
+		devices:         make(map[string]*hkontroller.Device),
+		verified:        make(map[string]*VerifiedConn),
+		charIDs:         make(map[string]*cameraCharIDs),
+		motionCallbacks: make(map[string]func(bool)),
 	}
 }
 
@@ -351,7 +354,18 @@ func (c *Controller) reconnect(deviceName string) error {
 	c.mu.Lock()
 	c.verified[deviceName] = vc
 	c.charIDs[deviceName] = ids
+	motionCb := c.motionCallbacks[deviceName]
+	motionCtx := c.motionCtx
 	c.mu.Unlock()
+
+	// Re-subscribe to motion events on the new connection.
+	if motionCb != nil && motionCtx != nil {
+		if err := c.doSubscribeMotion(motionCtx, deviceName, motionCb); err != nil {
+			c.logger.Warn("failed to re-subscribe motion after reconnect", "name", deviceName, "error", err)
+		} else {
+			c.logger.Info("motion sensor re-subscribed after reconnect", "name", deviceName)
+		}
+	}
 
 	c.logger.Info("camera reconnected", "name", deviceName)
 	return nil
@@ -548,7 +562,21 @@ func (c *Controller) StopStream(ctx context.Context, deviceName string, sessionI
 }
 
 // SubscribeMotionSensor subscribes to the MotionSensor.MotionDetected characteristic.
+// The callback and context are stored so the subscription can be re-established
+// after a HAP reconnection.
 func (c *Controller) SubscribeMotionSensor(ctx context.Context, deviceName string, callback func(detected bool)) error {
+	// Store for re-subscribe after reconnect.
+	c.mu.Lock()
+	c.motionCallbacks[deviceName] = callback
+	c.motionCtx = ctx
+	c.mu.Unlock()
+
+	return c.doSubscribeMotion(ctx, deviceName, callback)
+}
+
+// doSubscribeMotion performs the actual motion subscription on the current
+// verified connection. Called by SubscribeMotionSensor and by reconnect.
+func (c *Controller) doSubscribeMotion(ctx context.Context, deviceName string, callback func(detected bool)) error {
 	c.mu.Lock()
 	vc := c.verified[deviceName]
 	ids := c.charIDs[deviceName]
@@ -566,15 +594,18 @@ func (c *Controller) SubscribeMotionSensor(ctx context.Context, deviceName strin
 		return fmt.Errorf("subscribe motion: %w", err)
 	}
 
+	// Capture the current client so goroutines exit when this connection dies.
+	client := vc.Client
+
 	// Read events from the event channel in background.
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case event, ok := <-vc.Client.Events():
+			case event, ok := <-client.Events():
 				if !ok {
-					c.logger.Warn("motion event channel closed")
+					c.logger.Warn("motion event channel closed (will re-subscribe on reconnect)")
 					return
 				}
 				c.logger.Debug("HAP event received", "characteristics", fmt.Sprintf("%+v", event.Characteristics))
@@ -596,6 +627,7 @@ func (c *Controller) SubscribeMotionSensor(ctx context.Context, deviceName strin
 
 	// Also poll motion characteristic periodically as fallback,
 	// since some cameras don't reliably push EVENT notifications.
+	// Stops when the client's Done channel closes (connection lost) or ctx is cancelled.
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -604,12 +636,19 @@ func (c *Controller) SubscribeMotionSensor(ctx context.Context, deviceName strin
 			select {
 			case <-ctx.Done():
 				return
+			case <-client.Done():
+				c.logger.Debug("motion poll loop exiting (connection closed)")
+				return
 			case <-ticker.C:
-				resp, err := vc.Client.GetCharacteristics(
+				resp, err := client.GetCharacteristics(
 					fmt.Sprintf("%d.%d", ids.motionDetectedAID, ids.motionDetectedIID),
 				)
 				if err != nil {
 					c.logger.Debug("poll motion failed", "error", err)
+					if isConnError(err) {
+						c.logger.Debug("motion poll loop exiting (connection error)")
+						return
+					}
 					continue
 				}
 				if len(resp.Characteristics) == 0 {
