@@ -13,7 +13,12 @@ type Config struct {
 	LogLevel     string         `yaml:"log_level"`
 	PairingStore string         `yaml:"pairing_store"`
 	BindAddress  string         `yaml:"bind_address"`
-	Cameras      []CameraConfig `yaml:"cameras"`
+	// ListenAddress restricts the RTSP and ONVIF listeners to a specific
+	// interface (e.g. "127.0.0.1" to expose them only to local consumers).
+	// Empty = bind to all interfaces (default). BindAddress is unaffected
+	// since it must remain LAN-routable for the camera-side SRTP path.
+	ListenAddress string         `yaml:"listen_address"`
+	Cameras       []CameraConfig `yaml:"cameras"`
 }
 
 type CameraConfig struct {

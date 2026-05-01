@@ -23,11 +23,12 @@ type RTSPServer struct {
 	session *Session
 	stream  *gortsplib.ServerStream
 
-	mu     sync.Mutex
-	port   int
-	path   string
-	desc   *description.Session
-	medias []*description.Media
+	mu         sync.Mutex
+	listenAddr string
+	port       int
+	path       string
+	desc       *description.Session
+	medias     []*description.Media
 
 	videoFormat  *format.H264
 	audioFormat  format.Format
@@ -62,22 +63,24 @@ type RTSPServer struct {
 
 // RTSPServerConfig configures the RTSP server.
 type RTSPServerConfig struct {
-	Port       int
-	Path       string
-	HasAudio   bool
-	AudioCodec string // "aac-eld" or "opus"
-	SampleRate int
-	AudioGain  int // PCM gain factor for AAC-ELD→AAC-LC transcoding
+	ListenAddress string // "" = all interfaces, "127.0.0.1" = local only
+	Port          int
+	Path          string
+	HasAudio      bool
+	AudioCodec    string // "aac-eld" or "opus"
+	SampleRate    int
+	AudioGain     int // PCM gain factor for AAC-ELD→AAC-LC transcoding
 }
 
 // NewRTSPServer creates a new RTSP server for a single camera.
 func NewRTSPServer(cfg RTSPServerConfig, session *Session, logger *slog.Logger) *RTSPServer {
 	s := &RTSPServer{
-		logger:   logger,
-		session:  session,
-		port:     cfg.Port,
-		path:     cfg.Path,
-		idrReady: make(chan struct{}),
+		logger:     logger,
+		session:    session,
+		listenAddr: cfg.ListenAddress,
+		port:       cfg.Port,
+		path:       cfg.Path,
+		idrReady:   make(chan struct{}),
 	}
 
 	// Build SDP with H.264 video.
@@ -172,7 +175,7 @@ func NewRTSPServer(cfg RTSPServerConfig, session *Session, logger *slog.Logger) 
 func (s *RTSPServer) Start() error {
 	s.server = &gortsplib.Server{
 		Handler:        s,
-		RTSPAddress:    fmt.Sprintf(":%d", s.port),
+		RTSPAddress:    fmt.Sprintf("%s:%d", s.listenAddr, s.port),
 		WriteQueueSize: 2048,
 		WriteTimeout:   30 * time.Second, // survive ffmpeg's 5s probe phase
 	}

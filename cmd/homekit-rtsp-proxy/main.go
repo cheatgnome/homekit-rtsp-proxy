@@ -213,12 +213,13 @@ func main() {
 
 		// Create RTSP server.
 		rtspServer = stream.NewRTSPServer(stream.RTSPServerConfig{
-			Port:       cam.RTSP.Port,
-			Path:       cam.RTSP.Path,
-			HasAudio:   cam.Audio.Enabled,
-			AudioCodec: cam.Audio.Codec,
-			SampleRate: cam.Audio.SampleRate,
-			AudioGain:  *cam.Audio.Gain,
+			ListenAddress: cfg.ListenAddress,
+			Port:          cam.RTSP.Port,
+			Path:          cam.RTSP.Path,
+			HasAudio:      cam.Audio.Enabled,
+			AudioCodec:    cam.Audio.Codec,
+			SampleRate:    cam.Audio.SampleRate,
+			AudioGain:     *cam.Audio.Gain,
 		}, session, camLogger)
 
 		// Wire SRTP proxy output to RTSP server.
@@ -229,7 +230,14 @@ func main() {
 			os.Exit(1)
 		}
 
-		rtspURL := fmt.Sprintf("rtsp://%s:%d%s", bindAddr, cam.RTSP.Port, cam.RTSP.Path)
+		// Advertise the address consumers actually reach us on. When
+		// ListenAddress is set (e.g. 127.0.0.1) it overrides bindAddr,
+		// which is reserved for the camera-side SRTP path.
+		advertiseAddr := bindAddr
+		if cfg.ListenAddress != "" {
+			advertiseAddr = cfg.ListenAddress
+		}
+		rtspURL := fmt.Sprintf("rtsp://%s:%d%s", advertiseAddr, cam.RTSP.Port, cam.RTSP.Path)
 		camLogger.Info("RTSP URL available", "url", rtspURL)
 
 		svc := cameraServices{
@@ -240,16 +248,17 @@ func main() {
 
 		// Set up ONVIF server if enabled.
 		if cam.ONVIF.Enabled {
-			hostAddr := fmt.Sprintf("%s:%d", bindAddr, cam.ONVIF.Port)
+			hostAddr := fmt.Sprintf("%s:%d", advertiseAddr, cam.ONVIF.Port)
 			onvifSrv := onvif.NewServer(onvif.ServerConfig{
-				Port:         cam.ONVIF.Port,
-				HostAddr:     hostAddr,
-				RTSPURL:      rtspURL,
-				CameraName:   cam.Name,
-				VideoWidth:   cam.Video.Width,
-				VideoHeight:  cam.Video.Height,
-				VideoFPS:     cam.Video.FPS,
-				VideoBitrate: cam.Video.MaxBitrate,
+				ListenAddress: cfg.ListenAddress,
+				Port:          cam.ONVIF.Port,
+				HostAddr:      hostAddr,
+				RTSPURL:       rtspURL,
+				CameraName:    cam.Name,
+				VideoWidth:    cam.Video.Width,
+				VideoHeight:   cam.Video.Height,
+				VideoFPS:      cam.Video.FPS,
+				VideoBitrate:  cam.Video.MaxBitrate,
 			}, camLogger)
 
 			if err := onvifSrv.Start(); err != nil {

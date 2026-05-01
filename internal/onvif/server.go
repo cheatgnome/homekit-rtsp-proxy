@@ -15,14 +15,15 @@ import (
 // Server implements an ONVIF-compatible HTTP server that provides
 // device, media, and event services for a single camera.
 type Server struct {
-	logger     *slog.Logger
-	port       int
-	hostAddr   string // host:port for self-referencing URLs
-	rtspURL    string
-	cameraName string
-	videoWidth int
-	videoHeight int
-	videoFPS   int
+	logger       *slog.Logger
+	listenAddr   string
+	port         int
+	hostAddr     string // host:port for self-referencing URLs
+	rtspURL      string
+	cameraName   string
+	videoWidth   int
+	videoHeight  int
+	videoFPS     int
 	videoBitrate int
 
 	pullpoints *PullPointManager
@@ -31,19 +32,21 @@ type Server struct {
 
 // ServerConfig configures the ONVIF server.
 type ServerConfig struct {
-	Port        int
-	HostAddr    string // e.g., "192.168.1.10:8580"
-	RTSPURL     string // e.g., "rtsp://192.168.1.10:8554/live"
-	CameraName  string
-	VideoWidth  int
-	VideoHeight int
-	VideoFPS    int
-	VideoBitrate int
+	ListenAddress string // "" = all interfaces, "127.0.0.1" = local only
+	Port          int
+	HostAddr      string // e.g., "192.168.1.10:8580"
+	RTSPURL       string // e.g., "rtsp://192.168.1.10:8554/live"
+	CameraName    string
+	VideoWidth    int
+	VideoHeight   int
+	VideoFPS      int
+	VideoBitrate  int
 }
 
 func NewServer(cfg ServerConfig, logger *slog.Logger) *Server {
 	return &Server{
 		logger:       logger,
+		listenAddr:   cfg.ListenAddress,
 		port:         cfg.Port,
 		hostAddr:     cfg.HostAddr,
 		rtspURL:      cfg.RTSPURL,
@@ -65,7 +68,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/onvif/event_service/pullpoint/", s.handlePullPoint)
 
 	s.httpServer = &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.port),
+		Addr:    fmt.Sprintf("%s:%d", s.listenAddr, s.port),
 		Handler: mux,
 	}
 
