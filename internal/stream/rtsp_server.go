@@ -59,6 +59,11 @@ type RTSPServer struct {
 	// Audio transcoder: AAC-ELD → AAC-LC (nil if audio disabled or non-ELD codec).
 	transcoder *AudioTranscoder
 	audioSeq   uint16 // monotonic audio seq counter (transcoding changes packet count)
+
+	// Snapshotter: decodes the cached IDR into a JPEG kept in memory for
+	// the ONVIF /snapshot.jpg endpoint. Refreshed each time a new IDR is
+	// fully assembled in the cache.
+	snapshotter *Snapshotter
 }
 
 // RTSPServerConfig configures the RTSP server.
@@ -74,13 +79,20 @@ type RTSPServerConfig struct {
 
 // NewRTSPServer creates a new RTSP server for a single camera.
 func NewRTSPServer(cfg RTSPServerConfig, session *Session, logger *slog.Logger) *RTSPServer {
+	snap, err := NewSnapshotter(logger)
+	if err != nil {
+		// Non-fatal: snapshots just won't be available.
+		logger.Warn("failed to init snapshotter, /snapshot.jpg will be unavailable", "error", err)
+	}
+
 	s := &RTSPServer{
-		logger:     logger,
-		session:    session,
-		listenAddr: cfg.ListenAddress,
-		port:       cfg.Port,
-		path:       cfg.Path,
-		idrReady:   make(chan struct{}),
+		logger:      logger,
+		session:     session,
+		listenAddr:  cfg.ListenAddress,
+		port:        cfg.Port,
+		path:        cfg.Path,
+		idrReady:    make(chan struct{}),
+		snapshotter: snap,
 	}
 
 	// Build SDP with H.264 video.
@@ -254,10 +266,36 @@ func (s *RTSPServer) cacheIDRPacket(pkt *rtp.Packet) {
 				default:
 					close(s.idrReady)
 				}
+
+				// Refresh the snapshot JPEG off the lock-holding path.
+				if s.snapshotter != nil && s.gotParams {
+					sps, pps := s.videoFormat.SafeParams()
+					cache := s.idrCache
+					go s.refreshSnapshot(cache, sps, pps)
+				}
 			}
 			return
 		}
 	}
+}
+
+// refreshSnapshot reassembles the cached IDR packets into Annex-B and
+// asks the Snapshotter to decode them into a fresh JPEG. Runs off the
+// hot RTP path.
+func (s *RTSPServer) refreshSnapshot(idrCache []*rtp.Packet, sps, pps []byte) {
+	annexB := BuildIDRAnnexB(idrCache, sps, pps)
+	if err := s.snapshotter.Update(annexB); err != nil {
+		s.logger.Warn("snapshot refresh failed", "error", err)
+	}
+}
+
+// LatestSnapshotJPEG returns the most recently encoded JPEG snapshot, or
+// nil if no IDR has been decoded yet. Implements onvif.SnapshotProvider.
+func (s *RTSPServer) LatestSnapshotJPEG() []byte {
+	if s.snapshotter == nil {
+		return nil
+	}
+	return s.snapshotter.LatestJPEG()
 }
 
 // ResetVideoRTP must be called when a new camera stream session starts.
@@ -495,6 +533,11 @@ func (s *RTSPServer) Stop() {
 	if s.transcoder != nil {
 		s.transcoder.Close()
 		s.transcoder = nil
+	}
+
+	if s.snapshotter != nil {
+		s.snapshotter.Close()
+		s.snapshotter = nil
 	}
 
 	if s.stream != nil {

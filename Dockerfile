@@ -1,6 +1,9 @@
 FROM golang:1.25-bookworm
 RUN sed -i 's/^Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources && \
-    apt-get update && apt-get install -y libfdk-aac-dev && rm -rf /var/lib/apt/lists/*
+    apt-get update && apt-get install -y \
+        libfdk-aac-dev \
+        libavcodec-dev libavutil-dev libswscale-dev \
+        && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download

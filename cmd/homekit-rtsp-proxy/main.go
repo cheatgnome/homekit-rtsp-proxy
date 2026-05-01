@@ -261,6 +261,7 @@ func main() {
 				VideoHeight:   cam.Video.Height,
 				VideoFPS:      cam.Video.FPS,
 				VideoBitrate:  cam.Video.MaxBitrate,
+				Snapshots:     rtspServer,
 			}, camLogger)
 
 			if err := onvifSrv.Start(); err != nil {

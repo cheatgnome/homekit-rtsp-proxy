@@ -12,6 +12,12 @@ import (
 	"github.com/google/uuid"
 )
 
+// SnapshotProvider returns the most recent JPEG-encoded snapshot for a
+// camera, or nil if none is available yet.
+type SnapshotProvider interface {
+	LatestSnapshotJPEG() []byte
+}
+
 // Server implements an ONVIF-compatible HTTP server that provides
 // device, media, and event services for a single camera.
 type Server struct {
@@ -20,6 +26,7 @@ type Server struct {
 	port         int
 	hostAddr     string // host:port for self-referencing URLs
 	rtspURL      string
+	snapshotURL  string
 	cameraName   string
 	videoWidth   int
 	videoHeight  int
@@ -28,6 +35,7 @@ type Server struct {
 
 	pullpoints *PullPointManager
 	httpServer *http.Server
+	snapshots  SnapshotProvider // optional; nil disables /snapshot.jpg
 }
 
 // ServerConfig configures the ONVIF server.
@@ -41,10 +49,13 @@ type ServerConfig struct {
 	VideoHeight   int
 	VideoFPS      int
 	VideoBitrate  int
+	// Snapshots, when non-nil, enables the /snapshot.jpg HTTP endpoint
+	// and a non-empty GetSnapshotUri SOAP response.
+	Snapshots SnapshotProvider
 }
 
 func NewServer(cfg ServerConfig, logger *slog.Logger) *Server {
-	return &Server{
+	s := &Server{
 		logger:       logger,
 		listenAddr:   cfg.ListenAddress,
 		port:         cfg.Port,
@@ -56,7 +67,12 @@ func NewServer(cfg ServerConfig, logger *slog.Logger) *Server {
 		videoFPS:     cfg.VideoFPS,
 		videoBitrate: cfg.VideoBitrate,
 		pullpoints:   NewPullPointManager(),
+		snapshots:    cfg.Snapshots,
 	}
+	if cfg.Snapshots != nil {
+		s.snapshotURL = fmt.Sprintf("http://%s/snapshot.jpg", cfg.HostAddr)
+	}
+	return s
 }
 
 // Start begins the ONVIF HTTP server.
@@ -66,6 +82,9 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/onvif/media_service", s.handleMediaService)
 	mux.HandleFunc("/onvif/event_service", s.handleEventService)
 	mux.HandleFunc("/onvif/event_service/pullpoint/", s.handlePullPoint)
+	if s.snapshots != nil {
+		mux.HandleFunc("/snapshot.jpg", s.handleSnapshot)
+	}
 
 	s.httpServer = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", s.listenAddr, s.port),
@@ -255,7 +274,9 @@ func (s *Server) handleMediaService(w http.ResponseWriter, r *http.Request) {
 		s.writeSOAP(w, `<trt:SetVideoEncoderConfigurationResponse/>`)
 
 	case "GetSnapshotUri":
-		s.writeSOAP(w, `<trt:GetSnapshotUriResponse><trt:MediaUri><tt:Uri></tt:Uri></trt:MediaUri></trt:GetSnapshotUriResponse>`)
+		s.writeSOAP(w, fmt.Sprintf(
+			`<trt:GetSnapshotUriResponse><trt:MediaUri><tt:Uri>%s</tt:Uri></trt:MediaUri></trt:GetSnapshotUriResponse>`,
+			s.snapshotURL))
 
 	case "GetAudioSources":
 		s.writeSOAP(w, `<trt:GetAudioSourcesResponse/>`)
@@ -369,4 +390,20 @@ func (s *Server) handlePullPoint(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unknown action", http.StatusBadRequest)
 	}
+}
+
+// handleSnapshot serves the latest cached JPEG snapshot, if any.
+// Polls (e.g., from HA's Generic Camera) typically arrive at a few Hz;
+// the JPEG itself is refreshed once per H.264 IDR (~every GOP) by the
+// RTSP server's Snapshotter.
+func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	jpeg := s.snapshots.LatestSnapshotJPEG()
+	if len(jpeg) == 0 {
+		http.Error(w, "no snapshot available yet", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "no-cache, max-age=0")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(jpeg)))
+	w.Write(jpeg)
 }
