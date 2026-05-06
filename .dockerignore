@@ -1,0 +1,25 @@
+.git
+.gitignore
+.dockerignore
+
+# Local secrets / runtime state — must never enter the image.
+.hkontroller/
+pairings/
+config.yaml
+config.*.yaml
+
+# Stale prebuilt binaries left in the source tree.
+/homekit-rtsp-proxy
+/debug-pair
+/test-rtsp
+
+# Editor / agent / OS cruft.
+.claude/
+CLAUDE.md
+.idea/
+.vscode/
+.DS_Store
+
+# Captures, logs, etc.
+*.pcap
+*.log
