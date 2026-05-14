@@ -1,0 +1,16 @@
+services:
+  homekit-rtsp-proxy:
+    container_name: Homekit-Rtsp-Proxy
+    image: homekit-rtsp-proxy:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /app/data
+    volumes:
+      - type: bind
+        source: /mnt/user/appdata/homekit-rtsp-proxy
+        target: /app/data
+        bind:
+          create_host_path: true

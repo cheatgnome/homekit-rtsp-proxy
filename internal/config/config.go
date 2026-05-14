@@ -38,6 +38,7 @@ type RTSPConfig struct {
 }
 
 type VideoConfig struct {
+	Channel    int `yaml:"channel"`
 	Width      int `yaml:"width"`
 	Height     int `yaml:"height"`
 	FPS        int `yaml:"fps"`

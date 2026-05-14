@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -114,6 +115,55 @@ func main() {
 		cam := cam
 		camLogger := logger.With("camera", cam.Name)
 
+		videoConfig := hap.VideoSelection{
+			Profile:      hap.H264ProfileMain,
+			Level:        hap.H264Level4_0,
+			Width:        uint16(cam.Video.Width),
+			Height:       uint16(cam.Video.Height),
+			FPS:          cam.Video.FPS,
+			MaxBitrate:   cam.Video.MaxBitrate,
+			PayloadType:  99,
+			RTCPInterval: 0.5,
+		}
+		videoOptions, err := controller.ResolveVideoOptions(cam.Name, videoConfig, cam.Video.Channel)
+		if err != nil {
+			camLogger.Error("failed to resolve HomeKit video channel", "error", err)
+			os.Exit(1)
+		}
+		for i := range videoOptions {
+			videoOptions[i].Video.MaxBitrate = scaledVideoBitrate(cam.Video.MaxBitrate, videoConfig, videoOptions[i].Video)
+		}
+		if len(videoOptions) == 0 {
+			camLogger.Error("no usable HomeKit video channels")
+			os.Exit(1)
+		}
+
+		var adaptiveMu sync.Mutex
+		currentOption := 0
+		switching := false
+		consecutiveLossWindows := 0
+		lastSwitch := time.Now().Add(-time.Minute)
+
+		currentVideo := func() hap.VideoSelection {
+			adaptiveMu.Lock()
+			defer adaptiveMu.Unlock()
+			return videoOptions[currentOption].Video
+		}
+		currentChannel := func() int {
+			adaptiveMu.Lock()
+			defer adaptiveMu.Unlock()
+			return videoOptions[currentOption].Channel
+		}
+
+		resolvedVideoConfig := currentVideo()
+		resolvedChannel := currentChannel()
+		camLogger.Info("resolved HomeKit video channel",
+			"channel", resolvedChannel,
+			"width", resolvedVideoConfig.Width,
+			"height", resolvedVideoConfig.Height,
+			"fps", resolvedVideoConfig.FPS,
+			"max_bitrate", resolvedVideoConfig.MaxBitrate)
+
 		// Create SRTP proxy for this camera.
 		srtpProxy := stream.NewSRTPProxy(camLogger)
 
@@ -137,17 +187,6 @@ func main() {
 				}
 				camLogger.Info("SRTP ports opened", "video", videoPort, "audio", audioPort)
 
-				videoConfig := hap.VideoSelection{
-					Profile:      hap.H264ProfileMain,
-					Level:        hap.H264Level4_0,
-					Width:        uint16(cam.Video.Width),
-					Height:       uint16(cam.Video.Height),
-					FPS:          cam.Video.FPS,
-					MaxBitrate:   cam.Video.MaxBitrate,
-					PayloadType:  99,
-					RTCPInterval: 0.5,
-				}
-
 				audioConfig := hap.AudioSelection{
 					BitRateMode:  0x00, // Variable
 					PacketTime:   30,
@@ -165,13 +204,16 @@ func main() {
 				}
 
 				// Request stream from camera using the actual ports.
+				startVideoConfig := currentVideo()
+				startChannel := currentChannel()
 				resp, err := controller.StartStream(ctx, cam.Name, localIP,
 					uint16(videoPort), uint16(audioPort),
-					videoConfig, audioConfig)
+					startVideoConfig, audioConfig, startChannel)
 				if err != nil {
 					srtpProxy.Close()
 					return fmt.Errorf("start HAP stream: %w", err)
 				}
+				session.SetSessionID(resp.SessionID)
 
 				// Start SRTP decryption with camera's keys.
 				srtpCfg := stream.SRTPConfig{
@@ -257,10 +299,10 @@ func main() {
 				HostAddr:      hostAddr,
 				RTSPURL:       rtspURL,
 				CameraName:    cam.Name,
-				VideoWidth:    cam.Video.Width,
-				VideoHeight:   cam.Video.Height,
-				VideoFPS:      cam.Video.FPS,
-				VideoBitrate:  cam.Video.MaxBitrate,
+				VideoWidth:    int(resolvedVideoConfig.Width),
+				VideoHeight:   int(resolvedVideoConfig.Height),
+				VideoFPS:      resolvedVideoConfig.FPS,
+				VideoBitrate:  resolvedVideoConfig.MaxBitrate,
 				Snapshots:     rtspServer,
 			}, camLogger)
 
@@ -280,6 +322,59 @@ func main() {
 
 			svc.onvifSrv = onvifSrv
 		}
+
+		srtpProxy.SetVideoStatsCallback(func(stats stream.VideoStats) {
+			if cam.Video.Channel != 0 || stats.DeltaPackets < 100 {
+				return
+			}
+
+			adaptiveMu.Lock()
+			if switching || currentOption >= len(videoOptions)-1 {
+				adaptiveMu.Unlock()
+				return
+			}
+			if stats.DeltaDrops >= 20 || stats.DeltaDroppedFrames >= 3 {
+				consecutiveLossWindows++
+			} else if consecutiveLossWindows > 0 {
+				consecutiveLossWindows--
+			}
+			if consecutiveLossWindows < 3 || time.Since(lastSwitch) < 30*time.Second {
+				adaptiveMu.Unlock()
+				return
+			}
+
+			from := videoOptions[currentOption]
+			currentOption++
+			to := videoOptions[currentOption]
+			switching = true
+			consecutiveLossWindows = 0
+			lastSwitch = time.Now()
+			adaptiveMu.Unlock()
+
+			camLogger.Warn("sustained RTP loss detected, switching to lower HomeKit channel",
+				"from_channel", from.Channel,
+				"from_width", from.Video.Width,
+				"from_height", from.Video.Height,
+				"from_bitrate", from.Video.MaxBitrate,
+				"to_channel", to.Channel,
+				"to_width", to.Video.Width,
+				"to_height", to.Video.Height,
+				"to_bitrate", to.Video.MaxBitrate,
+				"delta_drops", stats.DeltaDrops,
+				"delta_dropped_frames", stats.DeltaDroppedFrames)
+
+			go func() {
+				if err := session.Restart(); err != nil {
+					camLogger.Error("adaptive channel switch failed", "error", err)
+					adaptiveMu.Lock()
+					currentOption--
+					adaptiveMu.Unlock()
+				}
+				adaptiveMu.Lock()
+				switching = false
+				adaptiveMu.Unlock()
+			}()
+		})
 
 		services = append(services, svc)
 	}
@@ -336,4 +431,21 @@ func detectLocalIP() string {
 	}
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+}
+
+func scaledVideoBitrate(configured int, requested, resolved hap.VideoSelection) int {
+	if configured <= 0 {
+		return 0
+	}
+	requestedPixels := int(requested.Width) * int(requested.Height)
+	resolvedPixels := int(resolved.Width) * int(resolved.Height)
+	if requestedPixels <= 0 || resolvedPixels <= 0 || resolvedPixels >= requestedPixels {
+		return configured
+	}
+
+	scaled := configured * resolvedPixels / requestedPixels
+	if scaled < 300 {
+		return 300
+	}
+	return scaled
 }

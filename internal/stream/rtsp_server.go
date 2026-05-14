@@ -313,6 +313,7 @@ func (s *RTSPServer) ResetVideoRTP() {
 		s.videoTSOffset = s.lastVideoTS + gap
 	}
 	s.videoSeqInited = false
+	s.gotParams = false
 	s.videoWriteMu.Unlock()
 
 	// Clear stale IDR cache — the camera will send a fresh IDR on the new session.
@@ -322,6 +323,10 @@ func (s *RTSPServer) ResetVideoRTP() {
 	s.collectingIDR = false
 	s.idrReady = make(chan struct{})
 	s.idrMu.Unlock()
+
+	if s.snapshotter != nil {
+		s.snapshotter.Reset()
+	}
 
 	s.logger.Info("video RTP state reset for new camera session",
 		"nextTSOffset", s.videoTSOffset, "nextSeqStart", s.videoSeq)
@@ -660,5 +665,3 @@ func (s *RTSPServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respon
 		},
 	}, nil
 }
-
-

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,13 +36,30 @@ const (
 
 // cameraCharIDs holds the discovered characteristic IIDs for a camera.
 type cameraCharIDs struct {
-	aid                   int
-	setupEndpointsIID     int
-	selectedConfigIID     int
-	streamingStatusIID    int
-	supportedAudioCfgIID  int
-	motionDetectedAID     int
-	motionDetectedIID     int
+	streams           []cameraStreamCharIDs
+	motionDetectedAID int
+	motionDetectedIID int
+}
+
+type cameraStreamCharIDs struct {
+	index                int
+	aid                  int
+	setupEndpointsIID    int
+	selectedConfigIID    int
+	streamingStatusIID   int
+	supportedVideoCfgIID int
+	supportedAudioCfgIID int
+	videoConfig          SupportedVideoConfig
+}
+
+type streamStartOption struct {
+	ids   cameraStreamCharIDs
+	video VideoSelection
+}
+
+type VideoOption struct {
+	Channel int
+	Video   VideoSelection
 }
 
 // Controller manages HAP connections to HomeKit cameras.
@@ -55,6 +73,8 @@ type Controller struct {
 	devices         map[string]*hkontroller.Device
 	verified        map[string]*VerifiedConn // our custom verified connections
 	charIDs         map[string]*cameraCharIDs
+	activeStreams   map[string]*cameraStreamCharIDs
+	streamStartMu   map[string]*sync.Mutex
 	motionCallbacks map[string]func(bool) // stored for re-subscribe after reconnect
 	motionCtx       context.Context       // context for motion subscriptions
 	controller      *hkontroller.Controller
@@ -76,6 +96,8 @@ func NewController(store *PairingStore, bindAddr string, logger *slog.Logger) *C
 		devices:         make(map[string]*hkontroller.Device),
 		verified:        make(map[string]*VerifiedConn),
 		charIDs:         make(map[string]*cameraCharIDs),
+		activeStreams:   make(map[string]*cameraStreamCharIDs),
+		streamStartMu:   make(map[string]*sync.Mutex),
 		motionCallbacks: make(map[string]func(bool)),
 	}
 }
@@ -309,18 +331,20 @@ func (c *Controller) PairCamera(ctx context.Context, deviceName, setupCode strin
 		vc.Client.Close()
 		return fmt.Errorf("find camera characteristics: %w", err)
 	}
+	if err := loadSupportedVideoConfigs(vc.Client, ids); err != nil {
+		c.logger.Warn("failed to read supported video configs", "name", deviceName, "error", err)
+	}
 
 	c.logger.Info("camera characteristics found",
 		"name", deviceName,
-		"aid", ids.aid,
-		"setupEndpoints_iid", ids.setupEndpointsIID,
-		"selectedConfig_iid", ids.selectedConfigIID,
+		"stream_channels", len(ids.streams),
+		"streams", describeStreams(ids.streams),
 		"hasMotion", ids.motionDetectedIID != 0)
 
 	// Read SupportedAudioStreamConfiguration to discover supported codecs.
-	if ids.supportedAudioCfgIID != 0 {
+	if ids.streams[0].supportedAudioCfgIID != 0 {
 		audioResp, err := vc.Client.GetCharacteristics(
-			fmt.Sprintf("%d.%d", ids.aid, ids.supportedAudioCfgIID),
+			fmt.Sprintf("%d.%d", ids.streams[0].aid, ids.streams[0].supportedAudioCfgIID),
 		)
 		if err == nil && len(audioResp.Characteristics) > 0 {
 			c.logger.Info("supported audio config (raw base64)",
@@ -430,6 +454,9 @@ func (c *Controller) reconnect(deviceName string) error {
 		vc.Client.Close()
 		return fmt.Errorf("find camera characteristics: %w", err)
 	}
+	if err := loadSupportedVideoConfigs(vc.Client, ids); err != nil {
+		c.logger.Warn("failed to read supported video configs after reconnect", "name", deviceName, "error", err)
+	}
 
 	c.mu.Lock()
 	c.verified[deviceName] = vc
@@ -464,21 +491,87 @@ func isConnError(err error) bool {
 		strings.Contains(s, "use of closed network connection")
 }
 
+func isRecoverableStreamSetupError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isConnError(err) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "read SetupEndpoints response") ||
+		strings.Contains(s, "SetupEndpoints response not ready") ||
+		strings.Contains(s, "HTTP 204")
+}
+
+func (c *Controller) streamStartLock(deviceName string) *sync.Mutex {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lock := c.streamStartMu[deviceName]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		c.streamStartMu[deviceName] = lock
+	}
+	return lock
+}
+
 // StartStream initiates a camera stream and returns the stream response.
-// If the HAP connection is broken, it automatically reconnects and retries once.
-func (c *Controller) StartStream(ctx context.Context, deviceName string, localIP net.IP, videoPort, audioPort uint16, videoConfig VideoSelection, audioConfig AudioSelection) (*StreamResponse, error) {
-	resp, err := c.doStartStream(ctx, deviceName, localIP, videoPort, audioPort, videoConfig, audioConfig)
-	if err != nil && isConnError(err) {
-		c.logger.Warn("stream start failed with connection error, reconnecting", "name", deviceName, "error", err)
+// If the HAP connection or stream setup state looks stale, it automatically
+// reconnects only that camera and retries once.
+func (c *Controller) StartStream(ctx context.Context, deviceName string, localIP net.IP, videoPort, audioPort uint16, videoConfig VideoSelection, audioConfig AudioSelection, preferredChannel int) (*StreamResponse, error) {
+	lock := c.streamStartLock(deviceName)
+	lock.Lock()
+	defer lock.Unlock()
+
+	resp, err := c.doStartStream(ctx, deviceName, localIP, videoPort, audioPort, videoConfig, audioConfig, preferredChannel)
+	if err != nil && isRecoverableStreamSetupError(err) {
+		c.logger.Warn("stream start failed with recoverable HAP error, reconnecting camera", "name", deviceName, "error", err)
 		if reconErr := c.reconnect(deviceName); reconErr != nil {
 			return nil, fmt.Errorf("reconnect failed: %w (original: %v)", reconErr, err)
 		}
-		return c.doStartStream(ctx, deviceName, localIP, videoPort, audioPort, videoConfig, audioConfig)
+		return c.doStartStream(ctx, deviceName, localIP, videoPort, audioPort, videoConfig, audioConfig, preferredChannel)
 	}
 	return resp, err
 }
 
-func (c *Controller) doStartStream(ctx context.Context, deviceName string, localIP net.IP, videoPort, audioPort uint16, videoConfig VideoSelection, audioConfig AudioSelection) (*StreamResponse, error) {
+func (c *Controller) ResolveVideoSelection(deviceName string, videoConfig VideoSelection, preferredChannel int) (VideoSelection, int, error) {
+	options, err := c.ResolveVideoOptions(deviceName, videoConfig, preferredChannel)
+	if err != nil {
+		return videoConfig, 0, err
+	}
+	if len(options) == 0 {
+		return videoConfig, 0, fmt.Errorf("device %q has no usable stream channels", deviceName)
+	}
+	return options[0].Video, options[0].Channel, nil
+}
+
+func (c *Controller) ResolveVideoOptions(deviceName string, videoConfig VideoSelection, preferredChannel int) ([]VideoOption, error) {
+	c.mu.Lock()
+	ids := c.charIDs[deviceName]
+	c.mu.Unlock()
+
+	if ids == nil {
+		return nil, fmt.Errorf("device %q characteristics not discovered", deviceName)
+	}
+	if len(ids.streams) == 0 {
+		return nil, fmt.Errorf("device %q has no camera stream-management services", deviceName)
+	}
+
+	options, err := selectStreamOptions(ids.streams, videoConfig, preferredChannel)
+	if err != nil {
+		return nil, err
+	}
+	resolved := make([]VideoOption, 0, len(options))
+	for _, option := range options {
+		resolved = append(resolved, VideoOption{
+			Channel: option.ids.index,
+			Video:   option.video,
+		})
+	}
+	return resolved, nil
+}
+
+func (c *Controller) doStartStream(ctx context.Context, deviceName string, localIP net.IP, videoPort, audioPort uint16, videoConfig VideoSelection, audioConfig AudioSelection, preferredChannel int) (*StreamResponse, error) {
 	c.mu.Lock()
 	vc := c.verified[deviceName]
 	ids := c.charIDs[deviceName]
@@ -490,9 +583,37 @@ func (c *Controller) doStartStream(ctx context.Context, deviceName string, local
 	if ids == nil {
 		return nil, fmt.Errorf("device %q characteristics not discovered", deviceName)
 	}
+	if len(ids.streams) == 0 {
+		return nil, fmt.Errorf("device %q has no camera stream-management services", deviceName)
+	}
 
 	client := vc.Client
+	options, err := selectStreamOptions(ids.streams, videoConfig, preferredChannel)
+	if err != nil {
+		return nil, err
+	}
 
+	var lastErr error
+	for attempt, option := range options {
+		streamResp, err := c.tryStartStream(ctx, client, deviceName, option.ids, localIP, videoPort, audioPort, option.video, audioConfig)
+		if err == nil {
+			c.mu.Lock()
+			active := option.ids
+			c.activeStreams[deviceName] = &active
+			c.mu.Unlock()
+			return streamResp, nil
+		}
+		lastErr = err
+		if len(options) > 1 {
+			c.logger.Warn("stream channel start failed, trying next channel",
+				"name", deviceName, "channel", option.ids.index, "attempt", attempt+1, "error", err)
+		}
+	}
+
+	return nil, lastErr
+}
+
+func (c *Controller) tryStartStream(ctx context.Context, client *HAPClient, deviceName string, ids cameraStreamCharIDs, localIP net.IP, videoPort, audioPort uint16, videoConfig VideoSelection, audioConfig AudioSelection) (*StreamResponse, error) {
 	// Step 1: Generate stream endpoints with random SRTP keys.
 	ep, err := GenerateStreamEndpoints(localIP, videoPort, audioPort)
 	if err != nil {
@@ -505,7 +626,7 @@ func (c *Controller) doStartStream(ctx context.Context, deviceName string, local
 
 	c.logger.Debug("writing SetupEndpoints", "name", deviceName,
 		"aid", ids.aid, "iid", ids.setupEndpointsIID,
-		"localIP", localIP, "videoPort", videoPort, "audioPort", audioPort)
+		"channel", ids.index, "localIP", localIP, "videoPort", videoPort, "audioPort", audioPort)
 
 	err = client.PutCharacteristics([]Characteristic{
 		{AID: ids.aid, IID: ids.setupEndpointsIID, Value: setupB64},
@@ -514,21 +635,12 @@ func (c *Controller) doStartStream(ctx context.Context, deviceName string, local
 		return nil, fmt.Errorf("write SetupEndpoints: %w", err)
 	}
 
-	// Step 3: Read back SetupEndpoints to get camera's response.
-	readResp, err := client.GetCharacteristics(
-		fmt.Sprintf("%d.%d", ids.aid, ids.setupEndpointsIID),
-	)
+	// Step 3: Read back SetupEndpoints to get camera's response. Some cameras
+	// briefly return an empty/non-string value immediately after accepting the
+	// write, so wait until the TLV response is actually ready.
+	respB64, err := c.readSetupEndpointsResponse(ctx, client, deviceName, ids)
 	if err != nil {
 		return nil, fmt.Errorf("read SetupEndpoints response: %w", err)
-	}
-
-	if len(readResp.Characteristics) == 0 {
-		return nil, fmt.Errorf("empty SetupEndpoints response")
-	}
-
-	respB64, ok := readResp.Characteristics[0].Value.(string)
-	if !ok {
-		return nil, fmt.Errorf("SetupEndpoints response not a string: %T", readResp.Characteristics[0].Value)
 	}
 
 	respTLV, err := base64.StdEncoding.DecodeString(respB64)
@@ -547,6 +659,7 @@ func (c *Controller) doStartStream(ctx context.Context, deviceName string, local
 
 	c.logger.Info("stream setup accepted",
 		"name", deviceName,
+		"channel", ids.index,
 		"remoteIP", streamResp.RemoteIP,
 		"videoPort", streamResp.RemoteVideoPort,
 		"audioPort", streamResp.RemoteAudioPort,
@@ -571,7 +684,8 @@ func (c *Controller) doStartStream(ctx context.Context, deviceName string, local
 		return nil, fmt.Errorf("write SelectedRTPStreamConfiguration: %w", err)
 	}
 
-	c.logger.Info("stream started", "name", deviceName)
+	c.logger.Info("stream started", "name", deviceName, "channel", ids.index,
+		"width", videoConfig.Width, "height", videoConfig.Height, "fps", videoConfig.FPS)
 
 	// Use the camera's SRTP keys for decryption. If the camera didn't return
 	// keys (some cameras use the controller's keys for both directions),
@@ -607,18 +721,52 @@ func (c *Controller) doStartStream(ctx context.Context, deviceName string, local
 	return streamResp, nil
 }
 
+func (c *Controller) readSetupEndpointsResponse(ctx context.Context, client *HAPClient, deviceName string, ids cameraStreamCharIDs) (string, error) {
+	charID := fmt.Sprintf("%d.%d", ids.aid, ids.setupEndpointsIID)
+	var lastErr error
+	for attempt := 1; attempt <= 10; attempt++ {
+		resp, err := client.GetCharacteristics(charID)
+		if err == nil {
+			if len(resp.Characteristics) == 0 {
+				lastErr = fmt.Errorf("empty SetupEndpoints response")
+			} else if respB64, ok := resp.Characteristics[0].Value.(string); ok && respB64 != "" {
+				return respB64, nil
+			} else {
+				lastErr = fmt.Errorf("SetupEndpoints response not ready: %T", resp.Characteristics[0].Value)
+			}
+		} else {
+			lastErr = err
+			if !strings.Contains(err.Error(), "HTTP 204") {
+				return "", err
+			}
+		}
+		c.logger.Debug("SetupEndpoints response not ready, retrying",
+			"name", deviceName,
+			"channel", ids.index,
+			"attempt", attempt,
+			"error", lastErr)
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(time.Duration(attempt) * 200 * time.Millisecond):
+		}
+	}
+	return "", lastErr
+}
+
 // StopStream sends the end command to stop a camera stream.
 func (c *Controller) StopStream(ctx context.Context, deviceName string, sessionID [16]byte) error {
 	c.mu.Lock()
 	vc := c.verified[deviceName]
-	ids := c.charIDs[deviceName]
+	active := c.activeStreams[deviceName]
 	c.mu.Unlock()
 
 	if vc == nil {
 		return fmt.Errorf("device %q not verified", deviceName)
 	}
-	if ids == nil {
-		return fmt.Errorf("device %q characteristics not discovered", deviceName)
+	if active == nil {
+		return fmt.Errorf("device %q has no active stream", deviceName)
 	}
 
 	// Send end command via SelectedRTPStreamConfiguration.
@@ -631,11 +779,15 @@ func (c *Controller) StopStream(ctx context.Context, deviceName string, sessionI
 	endB64 := base64.StdEncoding.EncodeToString(endTLV)
 
 	err := vc.Client.PutCharacteristics([]Characteristic{
-		{AID: ids.aid, IID: ids.selectedConfigIID, Value: endB64},
+		{AID: active.aid, IID: active.selectedConfigIID, Value: endB64},
 	})
 	if err != nil {
 		return fmt.Errorf("write end command: %w", err)
 	}
+
+	c.mu.Lock()
+	delete(c.activeStreams, deviceName)
+	c.mu.Unlock()
 
 	c.logger.Info("stream stopped", "name", deviceName)
 	return nil
@@ -759,6 +911,7 @@ func (c *Controller) doSubscribeMotion(ctx context.Context, deviceName string, c
 // findCameraCharIDs discovers the characteristic IIDs for camera streaming and motion.
 func findCameraCharIDs(accessories *AccessoriesResponse) (*cameraCharIDs, error) {
 	ids := &cameraCharIDs{}
+	streamIndex := 0
 
 	for _, acc := range accessories.Accessories {
 		for _, svc := range acc.Services {
@@ -766,21 +919,30 @@ func findCameraCharIDs(accessories *AccessoriesResponse) (*cameraCharIDs, error)
 			// Also handle short UUID form (e.g., "110" or full UUID).
 			svcTypeShort := trimHAPUUID(svcType)
 
-			if svcTypeShort == ServiceCameraRTPStreamMgmt && ids.setupEndpointsIID == 0 {
-				// Use the first CameraRTPStreamManagement service (typically the higher-res one).
-				ids.aid = acc.AID
+			if svcTypeShort == ServiceCameraRTPStreamMgmt {
+				streamIndex++
+				streamIDs := cameraStreamCharIDs{
+					index: streamIndex,
+					aid:   acc.AID,
+				}
 				for _, ch := range svc.Characteristics {
 					chType := trimHAPUUID(strings.TrimPrefix(ch.Type, "public.hap.characteristic."))
 					switch chType {
 					case CharSetupEndpoints:
-						ids.setupEndpointsIID = ch.IID
+						streamIDs.setupEndpointsIID = ch.IID
 					case CharSelectedRTPConfig:
-						ids.selectedConfigIID = ch.IID
+						streamIDs.selectedConfigIID = ch.IID
 					case CharStreamingStatus:
-						ids.streamingStatusIID = ch.IID
+						streamIDs.streamingStatusIID = ch.IID
+					case CharSupportedVideoConfig:
+						streamIDs.supportedVideoCfgIID = ch.IID
+						streamIDs.videoConfig = parseSupportedVideoConfigValue(ch.Value)
 					case CharSupportedAudioConfig:
-						ids.supportedAudioCfgIID = ch.IID
+						streamIDs.supportedAudioCfgIID = ch.IID
 					}
+				}
+				if streamIDs.setupEndpointsIID != 0 && streamIDs.selectedConfigIID != 0 {
+					ids.streams = append(ids.streams, streamIDs)
 				}
 			}
 
@@ -796,11 +958,284 @@ func findCameraCharIDs(accessories *AccessoriesResponse) (*cameraCharIDs, error)
 		}
 	}
 
-	if ids.setupEndpointsIID == 0 || ids.selectedConfigIID == 0 {
+	if len(ids.streams) == 0 {
 		return nil, fmt.Errorf("camera streaming characteristics not found in accessory database")
 	}
 
 	return ids, nil
+}
+
+func loadSupportedVideoConfigs(client *HAPClient, ids *cameraCharIDs) error {
+	var errs []string
+	for i := range ids.streams {
+		stream := &ids.streams[i]
+		if stream.supportedVideoCfgIID == 0 {
+			continue
+		}
+		resp, err := client.GetCharacteristics(
+			fmt.Sprintf("%d.%d", stream.aid, stream.supportedVideoCfgIID),
+		)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("channel %d: %v", stream.index, err))
+			continue
+		}
+		if len(resp.Characteristics) == 0 {
+			continue
+		}
+		cfg := parseSupportedVideoConfigValue(resp.Characteristics[0].Value)
+		if len(cfg.Attributes) > 0 {
+			stream.videoConfig = cfg
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func parseSupportedVideoConfigValue(value interface{}) SupportedVideoConfig {
+	s, ok := value.(string)
+	if !ok || s == "" {
+		return SupportedVideoConfig{}
+	}
+
+	data, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return SupportedVideoConfig{}
+	}
+
+	items, err := TLV8Decode(data)
+	if err != nil {
+		return SupportedVideoConfig{}
+	}
+
+	var cfg SupportedVideoConfig
+	for _, item := range items {
+		if item.Type != TLVVideoCodecType {
+			// SupportedVideoStreamConfiguration uses type 1 for each video
+			// codec configuration. It intentionally overlaps with selected
+			// stream sub-TLV constants.
+			continue
+		}
+		codecItems, err := TLV8Decode(item.Value)
+		if err != nil {
+			continue
+		}
+		for _, codecItem := range codecItems {
+			if codecItem.Type != TLVVideoAttributes {
+				continue
+			}
+			attrItems, err := TLV8Decode(codecItem.Value)
+			if err != nil {
+				continue
+			}
+			attr := VideoAttribute{
+				Width:  uint16FromTLV(attrItems, 0x01),
+				Height: uint16FromTLV(attrItems, 0x02),
+			}
+			if fps, ok := TLV8GetByte(attrItems, 0x03); ok {
+				attr.FPS = fps
+			}
+			if attr.Width != 0 && attr.Height != 0 {
+				cfg.Attributes = append(cfg.Attributes, attr)
+			}
+		}
+	}
+	return cfg
+}
+
+func uint16FromTLV(items []TLV8Item, typ byte) uint16 {
+	v := TLV8GetBytes(items, typ)
+	if len(v) < 2 {
+		return 0
+	}
+	return binary.LittleEndian.Uint16(v[:2])
+}
+
+func selectStreamOptions(streams []cameraStreamCharIDs, video VideoSelection, preferredChannel int) ([]streamStartOption, error) {
+	if preferredChannel < 0 {
+		return nil, fmt.Errorf("video.channel must be 0 or greater")
+	}
+	if preferredChannel > 0 {
+		for _, stream := range streams {
+			if stream.index == preferredChannel {
+				return []streamStartOption{{
+					ids:   stream,
+					video: videoSelectionForStream(stream, video),
+				}}, nil
+			}
+		}
+		return nil, fmt.Errorf("video.channel %d not found; camera advertised %d stream channel(s)", preferredChannel, len(streams))
+	}
+
+	options := autoStreamOptions(streams, video)
+	if len(options) > 0 {
+		return options, nil
+	}
+
+	ordered := append([]cameraStreamCharIDs(nil), streams...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return streamMatchScore(ordered[i], video) < streamMatchScore(ordered[j], video)
+	})
+	for _, stream := range ordered {
+		options = append(options, streamStartOption{
+			ids:   stream,
+			video: videoSelectionForStream(stream, video),
+		})
+	}
+	return options, nil
+}
+
+func autoStreamOptions(streams []cameraStreamCharIDs, video VideoSelection) []streamStartOption {
+	targetPixels := int(video.Width) * int(video.Height)
+	bestByResolution := make(map[string]streamStartOption)
+
+	for _, stream := range streams {
+		for _, attr := range stream.videoConfig.Attributes {
+			pixels := int(attr.Width) * int(attr.Height)
+			if targetPixels > 0 && pixels > targetPixels {
+				continue
+			}
+			optionVideo := video
+			optionVideo.Width = attr.Width
+			optionVideo.Height = attr.Height
+			if attr.FPS != 0 {
+				optionVideo.FPS = int(attr.FPS)
+			}
+
+			key := fmt.Sprintf("%dx%d@%d", optionVideo.Width, optionVideo.Height, optionVideo.FPS)
+			existing, ok := bestByResolution[key]
+			if !ok || streamPreferenceScore(stream, video) < streamPreferenceScore(existing.ids, video) {
+				bestByResolution[key] = streamStartOption{
+					ids:   stream,
+					video: optionVideo,
+				}
+			}
+		}
+	}
+
+	options := make([]streamStartOption, 0, len(bestByResolution))
+	for _, option := range bestByResolution {
+		options = append(options, option)
+	}
+	sort.SliceStable(options, func(i, j int) bool {
+		iPixels := int(options[i].video.Width) * int(options[i].video.Height)
+		jPixels := int(options[j].video.Width) * int(options[j].video.Height)
+		if iPixels != jPixels {
+			return iPixels > jPixels
+		}
+		if options[i].video.FPS != options[j].video.FPS {
+			return options[i].video.FPS > options[j].video.FPS
+		}
+		return options[i].ids.index < options[j].ids.index
+	})
+	return options
+}
+
+func streamPreferenceScore(stream cameraStreamCharIDs, video VideoSelection) int {
+	targetPixels := int(video.Width) * int(video.Height)
+	maxPixels := maxStreamPixels(stream)
+	if maxPixels == 0 {
+		return stream.index + 1_000_000
+	}
+	score := absInt(maxPixels - targetPixels)
+	if maxPixels > targetPixels {
+		score += maxPixels - targetPixels
+	}
+	return score + stream.index
+}
+
+func maxStreamPixels(stream cameraStreamCharIDs) int {
+	maxPixels := 0
+	for _, attr := range stream.videoConfig.Attributes {
+		pixels := int(attr.Width) * int(attr.Height)
+		if pixels > maxPixels {
+			maxPixels = pixels
+		}
+	}
+	return maxPixels
+}
+
+func videoSelectionForStream(stream cameraStreamCharIDs, video VideoSelection) VideoSelection {
+	if len(stream.videoConfig.Attributes) == 0 {
+		return video
+	}
+	best := stream.videoConfig.Attributes[0]
+	bestScore := attributeMatchScore(best, video)
+	for _, attr := range stream.videoConfig.Attributes[1:] {
+		score := attributeMatchScore(attr, video)
+		if score < bestScore {
+			best = attr
+			bestScore = score
+		}
+	}
+	video.Width = best.Width
+	video.Height = best.Height
+	if best.FPS != 0 {
+		video.FPS = int(best.FPS)
+	}
+	return video
+}
+
+func streamMatchScore(stream cameraStreamCharIDs, video VideoSelection) int {
+	if len(stream.videoConfig.Attributes) == 0 {
+		return 1_000_000 + stream.index
+	}
+
+	best := int(^uint(0) >> 1)
+	maxPixels := 0
+	for _, attr := range stream.videoConfig.Attributes {
+		pixels := int(attr.Width) * int(attr.Height)
+		if pixels > maxPixels {
+			maxPixels = pixels
+		}
+		score := attributeMatchScore(attr, video)
+		if score < best {
+			best = score
+		}
+	}
+	targetPixels := int(video.Width) * int(video.Height)
+	if maxPixels > targetPixels {
+		best += (maxPixels - targetPixels) / 2000
+	}
+	return best
+}
+
+func attributeMatchScore(attr VideoAttribute, video VideoSelection) int {
+	targetPixels := int(video.Width) * int(video.Height)
+	pixels := int(attr.Width) * int(attr.Height)
+	score := absInt(pixels-targetPixels) / 1000
+	score += absInt(int(attr.Width)-int(video.Width))
+	score += absInt(int(attr.Height)-int(video.Height))
+	if video.FPS > 0 && attr.FPS > 0 {
+		score += absInt(int(attr.FPS)-video.FPS) * 10
+	}
+	if pixels < targetPixels {
+		score += 500
+	}
+	return score
+}
+
+func describeStreams(streams []cameraStreamCharIDs) string {
+	var parts []string
+	for _, stream := range streams {
+		var attrs []string
+		for _, attr := range stream.videoConfig.Attributes {
+			attrs = append(attrs, fmt.Sprintf("%dx%d@%d", attr.Width, attr.Height, attr.FPS))
+		}
+		if len(attrs) == 0 {
+			attrs = append(attrs, "unknown")
+		}
+		parts = append(parts, fmt.Sprintf("channel%d[%s]", stream.index, strings.Join(attrs, ",")))
+	}
+	return strings.Join(parts, " ")
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 // trimHAPUUID extracts the short form from a full HAP UUID like "00000110-0000-1000-8000-0026BB765291".

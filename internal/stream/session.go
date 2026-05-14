@@ -35,6 +35,7 @@ func (s SessionState) String() string {
 // Session tracks the state of a single camera stream and its RTSP clients.
 type Session struct {
 	mu          sync.Mutex
+	cond        *sync.Cond
 	state       SessionState
 	clientCount int
 	logger      *slog.Logger
@@ -56,7 +57,7 @@ type Session struct {
 }
 
 func NewSession(cameraName string, idleTimeout time.Duration, logger *slog.Logger, onStart, onStop func() error) *Session {
-	return &Session{
+	s := &Session{
 		state:       StateIdle,
 		logger:      logger,
 		cameraName:  cameraName,
@@ -64,6 +65,8 @@ func NewSession(cameraName string, idleTimeout time.Duration, logger *slog.Logge
 		onStop:      onStop,
 		idleTimeout: idleTimeout,
 	}
+	s.cond = sync.NewCond(&s.mu)
+	return s
 }
 
 // ClientConnected is called when an RTSP client starts playing.
@@ -81,6 +84,12 @@ func (s *Session) ClientConnected() (bool, error) {
 		s.stopTimer = nil
 	}
 
+	for s.state == StateStopping {
+		s.logger.Info("RTSP client waiting for stream stop to finish",
+			"camera", s.cameraName)
+		s.cond.Wait()
+	}
+
 	s.clientCount++
 	s.logger.Info("RTSP client connected",
 		"camera", s.cameraName,
@@ -96,6 +105,7 @@ func (s *Session) ClientConnected() (bool, error) {
 	}
 
 	s.state = StateStarting
+	s.cond.Broadcast()
 	s.mu.Unlock()
 
 	err := s.onStart()
@@ -104,10 +114,12 @@ func (s *Session) ClientConnected() (bool, error) {
 	if err != nil {
 		s.state = StateIdle
 		s.clientCount--
+		s.cond.Broadcast()
 		return false, fmt.Errorf("start stream: %w", err)
 	}
 
 	s.state = StateStreaming
+	s.cond.Broadcast()
 	return true, nil
 }
 
@@ -171,12 +183,14 @@ func (s *Session) idleTimerFired() {
 // hold s.mu; the lock is briefly released around the user callback.
 func (s *Session) stopLocked() error {
 	s.state = StateStopping
+	s.cond.Broadcast()
 	s.mu.Unlock()
 
 	err := s.onStop()
 
 	s.mu.Lock()
 	s.state = StateIdle
+	s.cond.Broadcast()
 	if err != nil {
 		return fmt.Errorf("stop stream: %w", err)
 	}
@@ -201,6 +215,7 @@ func (s *Session) Restart() error {
 
 	clients := s.clientCount
 	s.state = StateStopping
+	s.cond.Broadcast()
 	s.mu.Unlock()
 
 	if err := s.onStop(); err != nil {
@@ -212,12 +227,14 @@ func (s *Session) Restart() error {
 
 	s.mu.Lock()
 	s.state = StateStarting
+	s.cond.Broadcast()
 	s.mu.Unlock()
 
 	if err := s.onStart(); err != nil {
 		s.mu.Lock()
 		s.state = StateIdle
 		s.clientCount = 0
+		s.cond.Broadcast()
 		s.mu.Unlock()
 		return fmt.Errorf("onStart during restart: %w", err)
 	}
@@ -225,6 +242,7 @@ func (s *Session) Restart() error {
 	s.mu.Lock()
 	s.state = StateStreaming
 	s.clientCount = clients
+	s.cond.Broadcast()
 	s.mu.Unlock()
 
 	s.logger.Info("session restarted after recovery",

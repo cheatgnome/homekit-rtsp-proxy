@@ -46,14 +46,31 @@ type SRTPProxy struct {
 	audioReturnTS  uint32
 
 	// Track highest received video seq for ReceptionReport.
-	highestVideoSeq uint32
+	rtcpMu                sync.Mutex
+	videoSeqInitialized   bool
+	videoBaseSeq          uint16
+	videoMaxSeq           uint16
+	videoSeqCycles        uint32
+	videoPacketsReceived  uint32
+	highestVideoSeq       uint32
 
 	// Callbacks for forwarding decrypted packets.
 	onVideoRTP func(*rtp.Packet)
 	onAudioRTP func(*rtp.Packet)
+	onVideoStats func(VideoStats)
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
+}
+
+type VideoStats struct {
+	TotalPackets       uint64
+	TotalDrops         uint64
+	TotalDroppedFrames uint64
+	DeltaPackets       uint64
+	DeltaDrops         uint64
+	DeltaDroppedFrames uint64
+	DecryptErrors      uint64
 }
 
 // SRTPConfig holds the SRTP keys from the SetupEndpoints exchange.
@@ -89,6 +106,10 @@ func NewSRTPProxy(logger *slog.Logger) *SRTPProxy {
 func (p *SRTPProxy) SetCallbacks(onVideo, onAudio func(*rtp.Packet)) {
 	p.onVideoRTP = onVideo
 	p.onAudioRTP = onAudio
+}
+
+func (p *SRTPProxy) SetVideoStatsCallback(callback func(VideoStats)) {
+	p.onVideoStats = callback
 }
 
 // OpenPorts opens UDP listeners on the specified ports (or random ports if 0).
@@ -211,6 +232,7 @@ func (p *SRTPProxy) readVideoLoop() {
 	var frameGapped bool          // true if current frame has a sequence gap
 	var frameBuf []*rtp.Packet    // buffered packets for current frame
 	lastLogTime := time.Now()
+	var lastStatsPackets, lastStatsDrops, lastStatsDroppedFrames uint64
 
 	for {
 		n, _, err := p.videoConn.ReadFromUDP(buf)
@@ -261,7 +283,6 @@ func (p *SRTPProxy) readVideoLoop() {
 
 		// Track camera's actual SSRC and highest seq.
 		if videoCount == 1 {
-			p.cameraVideoSSRC = pkt.Header.SSRC
 			lastFrameTS = pkt.Header.Timestamp
 			p.logger.Info("first video RTP packet received",
 				"pt", pkt.Header.PayloadType,
@@ -269,27 +290,38 @@ func (p *SRTPProxy) readVideoLoop() {
 				"seq", pkt.Header.SequenceNumber,
 				"size", n)
 		} else {
-			// Detect RTP sequence gaps (dropped UDP packets).
+			// Detect RTP sequence gaps (dropped UDP packets). Small backwards
+			// jumps are usually UDP reordering, not 65k dropped packets.
 			expected := lastSeq + 1
 			if pkt.Header.SequenceNumber != expected {
-				gap := int(pkt.Header.SequenceNumber) - int(expected)
-				if gap < 0 {
-					gap += 65536
+				forwardGap := int(pkt.Header.SequenceNumber) - int(expected)
+				if forwardGap < 0 {
+					forwardGap += 65536
 				}
-				dropCount += uint64(gap)
+				lateGap := int(expected) - int(pkt.Header.SequenceNumber)
+				if lateGap < 0 {
+					lateGap += 65536
+				}
+
+				if lateGap > 0 && lateGap < forwardGap {
+					p.logger.Debug("late video RTP packet ignored",
+						"expected", expected,
+						"got", pkt.Header.SequenceNumber,
+						"late_by", lateGap)
+					continue
+				}
+
+				dropCount += uint64(forwardGap)
 				frameGapped = true
 				p.logger.Warn("video RTP sequence gap",
 					"expected", expected,
 					"got", pkt.Header.SequenceNumber,
-					"gap", gap,
+					"gap", forwardGap,
 					"total_drops", dropCount)
 			}
 		}
 		lastSeq = pkt.Header.SequenceNumber
-		seq32 := uint32(pkt.Header.SequenceNumber)
-		if seq32 > p.highestVideoSeq || videoCount == 1 {
-			p.highestVideoSeq = seq32
-		}
+		p.updateVideoReceptionStats(pkt.Header.SequenceNumber, pkt.Header.SSRC)
 
 		// Frame boundary: new RTP timestamp means new frame.
 		// Flush previous frame buffer (forward if complete, drop if gapped).
@@ -337,6 +369,15 @@ func (p *SRTPProxy) readVideoLoop() {
 
 		// Log every second to track camera packet rate.
 		if time.Since(lastLogTime) >= time.Second {
+			stats := VideoStats{
+				TotalPackets:       videoCount,
+				TotalDrops:         dropCount,
+				TotalDroppedFrames: droppedFrames,
+				DeltaPackets:       videoCount - lastStatsPackets,
+				DeltaDrops:         dropCount - lastStatsDrops,
+				DeltaDroppedFrames: droppedFrames - lastStatsDroppedFrames,
+				DecryptErrors:      decryptErrors,
+			}
 			p.logger.Info("video RTP stats",
 				"total_packets", videoCount,
 				"rtcp_packets", rtcpCount,
@@ -345,6 +386,12 @@ func (p *SRTPProxy) readVideoLoop() {
 				"decrypt_errors", decryptErrors,
 				"seq", pkt.Header.SequenceNumber,
 				"ts", pkt.Header.Timestamp)
+			if p.onVideoStats != nil {
+				p.onVideoStats(stats)
+			}
+			lastStatsPackets = videoCount
+			lastStatsDrops = dropCount
+			lastStatsDroppedFrames = droppedFrames
 			lastLogTime = time.Now()
 		}
 	}
@@ -389,6 +436,53 @@ func (p *SRTPProxy) handleVideoRTCP(data []byte) {
 	if header.Type == rtcp.TypeSenderReport {
 		p.sendRTCPKeepalive()
 	}
+}
+
+func (p *SRTPProxy) updateVideoReceptionStats(seq uint16, ssrc uint32) {
+	p.rtcpMu.Lock()
+	defer p.rtcpMu.Unlock()
+
+	if ssrc != 0 {
+		p.cameraVideoSSRC = ssrc
+	}
+	if !p.videoSeqInitialized {
+		p.videoSeqInitialized = true
+		p.videoBaseSeq = seq
+		p.videoMaxSeq = seq
+		p.videoPacketsReceived = 1
+		p.highestVideoSeq = uint32(seq)
+		return
+	}
+
+	// RTP sequence numbers are 16-bit. RTCP Receiver Reports require the
+	// extended highest sequence number, including wrap cycles.
+	if seq < p.videoMaxSeq && p.videoMaxSeq-seq > 30000 {
+		p.videoSeqCycles += 1 << 16
+		p.videoMaxSeq = seq
+	} else if seq > p.videoMaxSeq {
+		p.videoMaxSeq = seq
+	}
+	p.videoPacketsReceived++
+	p.highestVideoSeq = p.videoSeqCycles + uint32(p.videoMaxSeq)
+}
+
+func (p *SRTPProxy) rtcpReceptionSnapshot() (ssrc uint32, highestSeq uint32, totalLost uint32, ok bool) {
+	p.rtcpMu.Lock()
+	defer p.rtcpMu.Unlock()
+
+	if !p.videoSeqInitialized || p.cameraVideoSSRC == 0 {
+		return 0, 0, 0, false
+	}
+
+	expected := int64(p.highestVideoSeq-uint32(p.videoBaseSeq)) + 1
+	lost := expected - int64(p.videoPacketsReceived)
+	if lost < 0 {
+		lost = 0
+	}
+	if lost > 0x7fffff {
+		lost = 0x7fffff
+	}
+	return p.cameraVideoSSRC, p.highestVideoSeq, uint32(lost), true
 }
 
 // readAudioLoop reads raw UDP packets from the audio port and decrypts them.
@@ -482,14 +576,19 @@ func (p *SRTPProxy) sendRTCPKeepalive() {
 		return
 	}
 
+	cameraSSRC, highestSeq, totalLost, ok := p.rtcpReceptionSnapshot()
+	if !ok {
+		p.logger.Debug("skipping RTCP RR until first video packet")
+		return
+	}
+
 	rr := &rtcp.ReceiverReport{
 		SSRC: p.controllerSSRC,
-		Reports: []rtcp.ReceptionReport{
-			{
-				SSRC:               p.cameraVideoSSRC,
-				LastSequenceNumber: p.highestVideoSeq,
-			},
-		},
+		Reports: []rtcp.ReceptionReport{{
+			SSRC:               cameraSSRC,
+			LastSequenceNumber: highestSeq,
+			TotalLost:          totalLost,
+		}},
 	}
 	rrBytes, err := rr.Marshal()
 	if err != nil {
@@ -509,8 +608,9 @@ func (p *SRTPProxy) sendRTCPKeepalive() {
 
 	p.logger.Debug("sent RTCP keepalive",
 		"controllerSSRC", p.controllerSSRC,
-		"cameraSSRC", p.cameraVideoSSRC,
-		"highestSeq", p.highestVideoSeq,
+		"cameraSSRC", cameraSSRC,
+		"highestSeq", highestSeq,
+		"totalLost", totalLost,
 		"addr", p.cameraAddr)
 }
 

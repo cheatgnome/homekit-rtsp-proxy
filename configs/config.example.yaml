@@ -20,6 +20,7 @@ cameras:
                                    # Reconnects within this window skip the HAP/encoder startup (~1s+).
                                    # 0 (or omit) = stop immediately on last disconnect.
     video:
+      channel: 0                    # 0 = adaptive auto-select; 1/2/3 = pin a HomeKit stream channel
       width: 1920
       height: 1080
       fps: 30

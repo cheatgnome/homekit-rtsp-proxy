@@ -58,6 +58,9 @@ static void snap_free(snap_ctx* s) {
 static int snap_decode(snap_ctx* s,
                        unsigned char* data, int size,
                        int* width, int* height) {
+    avcodec_flush_buffers(s->dec);
+    av_frame_unref(s->yuv);
+    av_packet_unref(s->in_pkt);
     s->in_pkt->data = data;
     s->in_pkt->size = size;
     int ret = avcodec_send_packet(s->dec, s->in_pkt);
@@ -73,7 +76,8 @@ static int snap_decode(snap_ctx* s,
 // stream's dimensions. quality is 1 (best) .. 31 (worst); 3 is a sane
 // default for snapshot use.
 static int snap_init_encoder(snap_ctx* s, int width, int height, int quality) {
-    if (s->enc) return 0;
+    if (s->enc && s->enc->width == width && s->enc->height == height) return 0;
+    if (s->enc) avcodec_free_context(&s->enc);
     const AVCodec* mjpeg = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
     if (!mjpeg) return -1;
     s->enc = avcodec_alloc_context3(mjpeg);
@@ -160,6 +164,18 @@ func (s *Snapshotter) Close() {
 	}
 }
 
+func (s *Snapshotter) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.jpeg = nil
+	s.width = 0
+	s.height = 0
+	if s.ctx != nil {
+		C.snap_free(s.ctx)
+		s.ctx = C.snap_new()
+	}
+}
+
 // Update decodes the given Annex-B bytestream (must contain at least
 // SPS+PPS+IDR) and re-encodes the result as JPEG. The cached JPEG is
 // replaced atomically.
@@ -191,6 +207,13 @@ func (s *Snapshotter) Update(annexB []byte) error {
 	defer C.free(unsafe.Pointer(out))
 
 	s.jpeg = C.GoBytes(unsafe.Pointer(out), outSize)
+	if s.width != 0 && s.height != 0 && (s.width != int(w) || s.height != int(h)) {
+		s.logger.Info("snapshot resolution changed",
+			"old_width", s.width,
+			"old_height", s.height,
+			"new_width", int(w),
+			"new_height", int(h))
+	}
 	s.width = int(w)
 	s.height = int(h)
 	return nil

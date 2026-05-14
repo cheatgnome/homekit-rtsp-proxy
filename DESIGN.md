@@ -414,7 +414,7 @@ type Controller struct {
 |--------|-------------|
 | `Start(ctx)` | Begin mDNS discovery, populate device map |
 | `PairCamera(ctx, name, code)` | Pair-setup (if needed) + pair-verify + enumerate characteristics |
-| `StartStream(ctx, name, localIP, videoPorts, videoConfig, audioConfig)` | Negotiate SRTP session, return camera's keys/ports/SSRCs |
+| `StartStream(ctx, name, localIP, videoPorts, videoConfig, audioConfig, preferredChannel)` | Negotiate SRTP session, return camera's keys/ports/SSRCs |
 | `StopStream(ctx, name, sessionID)` | Send End command to camera |
 | `SubscribeMotionSensor(ctx, name, callback)` | Subscribe to motion events + fallback polling |
 | `Stop()` | Close all connections, stop discovery |

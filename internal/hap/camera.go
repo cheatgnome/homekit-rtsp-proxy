@@ -187,6 +187,18 @@ type StreamResponse struct {
 	ControllerAudioSSRC  uint32
 }
 
+// VideoAttribute describes one HAP-advertised video resolution/framerate tuple.
+type VideoAttribute struct {
+	Width  uint16
+	Height uint16
+	FPS    byte
+}
+
+// SupportedVideoConfig contains the useful parts of SupportedVideoStreamConfiguration.
+type SupportedVideoConfig struct {
+	Attributes []VideoAttribute
+}
+
 // GenerateStreamEndpoints creates a new stream setup request with random keys.
 func GenerateStreamEndpoints(localIP net.IP, videoPort, audioPort uint16) (*StreamEndpoints, error) {
 	ep := &StreamEndpoints{

@@ -88,6 +88,7 @@ cameras:
       port: 8554
       path: "/live"
     video:
+      channel: 0                     # 0 = adaptive auto-select; 1/2/3 = pin a HomeKit stream channel
       width: 1920
       height: 1080
       fps: 30
@@ -101,6 +102,8 @@ cameras:
       enabled: true
       port: 8580
 ```
+
+For cameras that advertise multiple HomeKit stream channels, such as the Aqara G100, `video.channel: 0` enables adaptive selection. The proxy starts with the highest advertised stream at or below `video.width`/`video.height`; if sustained RTP packet loss is detected, it restarts the HomeKit stream on the next lower advertised option and scales `max_bitrate` for the lower resolution. Set `video.channel: 1`, `2`, or `3` to pin a specific camera channel and disable automatic switching.
 
 ### Audio gain
 
@@ -175,6 +178,18 @@ services:
 ```
 
 Place `config.yaml` in the `data/` directory. Host networking is required because mDNS uses multicast, and the camera sends SRTP to the host's real LAN IP.
+
+### Unraid Docker Compose
+
+This repository includes a `docker-compose.yml` that builds the image fully from local source and stores runtime files under `/mnt/user/appdata/homekit-rtsp-proxy`:
+
+```bash
+mkdir -p /mnt/user/appdata/homekit-rtsp-proxy
+cp configs/config.example.yaml /mnt/user/appdata/homekit-rtsp-proxy/config.yaml
+docker compose up -d --build
+```
+
+Edit `/mnt/user/appdata/homekit-rtsp-proxy/config.yaml` for your camera names, HomeKit setup codes, and ports before first startup. Pairing state is persisted in the same appdata directory, so container rebuilds and restarts keep the HomeKit pairing keys.
 
 ### Verifying the stream
 
