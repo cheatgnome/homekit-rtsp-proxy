@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -45,7 +46,7 @@ type Session struct {
 	sessionID [16]byte
 
 	// Callbacks for lifecycle transitions.
-	onStart func() error
+	onStart func(context.Context) error
 	onStop  func() error
 
 	// Warm-stream support: keep the camera streaming for idleTimeout after
@@ -54,9 +55,11 @@ type Session struct {
 	// cost again. Zero disables warm mode.
 	idleTimeout time.Duration
 	stopTimer   *time.Timer
+	startCancel context.CancelFunc
+	startToken  *struct{}
 }
 
-func NewSession(cameraName string, idleTimeout time.Duration, logger *slog.Logger, onStart, onStop func() error) *Session {
+func NewSession(cameraName string, idleTimeout time.Duration, logger *slog.Logger, onStart func(context.Context) error, onStop func() error) *Session {
 	s := &Session{
 		state:       StateIdle,
 		logger:      logger,
@@ -105,21 +108,39 @@ func (s *Session) ClientConnected() (bool, error) {
 	}
 
 	s.state = StateStarting
+	startCtx, startCancel := context.WithCancel(context.Background())
+	startToken := &struct{}{}
+	s.startCancel = startCancel
+	s.startToken = startToken
 	s.cond.Broadcast()
 	s.mu.Unlock()
 
-	err := s.onStart()
+	err := s.onStart(startCtx)
+	startCancel()
 
 	s.mu.Lock()
+	if s.startToken == startToken {
+		s.startCancel = nil
+		s.startToken = nil
+	}
 	if err != nil {
 		s.state = StateIdle
-		s.clientCount--
+		if s.clientCount > 0 {
+			s.clientCount--
+		}
 		s.cond.Broadcast()
 		return false, fmt.Errorf("start stream: %w", err)
 	}
 
 	s.state = StateStreaming
 	s.cond.Broadcast()
+	if s.clientCount == 0 {
+		s.logger.Info("stream started after clients disconnected, stopping",
+			"camera", s.cameraName)
+		if err := s.stopLocked(); err != nil {
+			return true, err
+		}
+	}
 	return true, nil
 }
 
@@ -142,6 +163,15 @@ func (s *Session) ClientDisconnected() error {
 		"state", s.state)
 
 	if s.clientCount > 0 {
+		return nil
+	}
+
+	if s.state == StateStarting {
+		if s.startCancel != nil {
+			s.logger.Info("canceling pending stream start after last client disconnected",
+				"camera", s.cameraName)
+			s.startCancel()
+		}
 		return nil
 	}
 
@@ -230,7 +260,7 @@ func (s *Session) Restart() error {
 	s.cond.Broadcast()
 	s.mu.Unlock()
 
-	if err := s.onStart(); err != nil {
+	if err := s.onStart(context.Background()); err != nil {
 		s.mu.Lock()
 		s.state = StateIdle
 		s.clientCount = 0
@@ -274,6 +304,13 @@ func (s *Session) State() SessionState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.state
+}
+
+// ClientCount returns the number of currently attached RTSP clients.
+func (s *Session) ClientCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.clientCount
 }
 
 // SetSessionID stores the HAP session ID for later use in stop commands.

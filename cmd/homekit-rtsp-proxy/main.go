@@ -154,7 +154,6 @@ func main() {
 			defer adaptiveMu.Unlock()
 			return videoOptions[currentOption].Channel
 		}
-
 		resolvedVideoConfig := currentVideo()
 		resolvedChannel := currentChannel()
 		camLogger.Info("resolved HomeKit video channel",
@@ -166,6 +165,8 @@ func main() {
 
 		// Create SRTP proxy for this camera.
 		srtpProxy := stream.NewSRTPProxy(camLogger)
+		lastVideoStatsMu := sync.Mutex{}
+		lastVideoStats := time.Now()
 
 		// Declare rtspServer early so the onStart closure can reference it.
 		// It will be assigned after the session is created (closures capture by reference).
@@ -176,9 +177,24 @@ func main() {
 		var session *stream.Session
 		session = stream.NewSession(cam.Name, cam.RTSP.IdleTimeout, camLogger,
 			// onStart: called when first RTSP client connects.
-			func() error {
+			func(startCtx context.Context) error {
+				hapCtx, cancelStart := context.WithCancel(ctx)
+				cancelDone := make(chan struct{})
+				go func() {
+					select {
+					case <-startCtx.Done():
+						cancelStart()
+					case <-cancelDone:
+					}
+				}()
+				defer close(cancelDone)
+				defer cancelStart()
+
 				camLogger.Info("starting camera stream")
 				rtspServer.ResetVideoRTP()
+				lastVideoStatsMu.Lock()
+				lastVideoStats = time.Now()
+				lastVideoStatsMu.Unlock()
 
 				// Open UDP ports first, so we know the actual ports for SetupEndpoints.
 				videoPort, audioPort, err := srtpProxy.OpenPorts(0, 0)
@@ -206,7 +222,7 @@ func main() {
 				// Request stream from camera using the actual ports.
 				startVideoConfig := currentVideo()
 				startChannel := currentChannel()
-				resp, err := controller.StartStream(ctx, cam.Name, localIP,
+				resp, err := controller.StartStream(hapCtx, cam.Name, localIP,
 					uint16(videoPort), uint16(audioPort),
 					startVideoConfig, audioConfig, startChannel)
 				if err != nil {
@@ -253,6 +269,25 @@ func main() {
 				return nil
 			},
 		)
+		tryRestartSession := func(reason string, attrs ...any) {
+			adaptiveMu.Lock()
+			if switching {
+				adaptiveMu.Unlock()
+				return
+			}
+			switching = true
+			adaptiveMu.Unlock()
+
+			logAttrs := append([]any{"reason", reason}, attrs...)
+			camLogger.Warn("restarting camera stream", logAttrs...)
+			if err := session.Restart(); err != nil {
+				camLogger.Error("camera stream restart failed", "reason", reason, "error", err)
+			}
+
+			adaptiveMu.Lock()
+			switching = false
+			adaptiveMu.Unlock()
+		}
 
 		// Create RTSP server.
 		rtspServer = stream.NewRTSPServer(stream.RTSPServerConfig{
@@ -324,6 +359,10 @@ func main() {
 		}
 
 		srtpProxy.SetVideoStatsCallback(func(stats stream.VideoStats) {
+			lastVideoStatsMu.Lock()
+			lastVideoStats = time.Now()
+			lastVideoStatsMu.Unlock()
+
 			if cam.Video.Channel != 0 || stats.DeltaPackets < 100 {
 				return
 			}
@@ -375,6 +414,37 @@ func main() {
 				adaptiveMu.Unlock()
 			}()
 		})
+
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			lastRestart := time.Now().Add(-time.Minute)
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+
+				if session.State() != stream.StateStreaming || session.ClientCount() == 0 {
+					continue
+				}
+
+				lastVideoStatsMu.Lock()
+				age := time.Since(lastVideoStats)
+				lastVideoStatsMu.Unlock()
+
+				if age < 20*time.Second || time.Since(lastRestart) < 45*time.Second {
+					continue
+				}
+
+				lastRestart = time.Now()
+				tryRestartSession("video packet watchdog timeout",
+					"silence", age.Round(time.Second),
+					"clients", session.ClientCount())
+			}
+		}()
 
 		services = append(services, svc)
 	}

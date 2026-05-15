@@ -62,6 +62,12 @@ type VideoOption struct {
 	Video   VideoSelection
 }
 
+type streamStartRecovery struct {
+	failures    int
+	nextAttempt time.Time
+	lastError   string
+}
+
 // Controller manages HAP connections to HomeKit cameras.
 type Controller struct {
 	store      *PairingStore
@@ -75,6 +81,7 @@ type Controller struct {
 	charIDs         map[string]*cameraCharIDs
 	activeStreams   map[string]*cameraStreamCharIDs
 	streamStartMu   map[string]*sync.Mutex
+	streamRecovery  map[string]*streamStartRecovery
 	motionCallbacks map[string]func(bool) // stored for re-subscribe after reconnect
 	motionCtx       context.Context       // context for motion subscriptions
 	controller      *hkontroller.Controller
@@ -98,6 +105,7 @@ func NewController(store *PairingStore, bindAddr string, logger *slog.Logger) *C
 		charIDs:         make(map[string]*cameraCharIDs),
 		activeStreams:   make(map[string]*cameraStreamCharIDs),
 		streamStartMu:   make(map[string]*sync.Mutex),
+		streamRecovery:  make(map[string]*streamStartRecovery),
 		motionCallbacks: make(map[string]func(bool)),
 	}
 }
@@ -200,7 +208,7 @@ func (c *Controller) recoverDevice(ctx context.Context, deviceName string) {
 			}
 		}
 		c.logger.Info("auto-recovery attempt", "name", deviceName, "attempt", i+1)
-		if err := c.reconnect(deviceName); err != nil {
+		if err := c.reconnect(ctx, deviceName); err != nil {
 			c.logger.Warn("auto-recovery attempt failed",
 				"name", deviceName, "attempt", i+1, "error", err)
 			continue
@@ -320,7 +328,7 @@ func (c *Controller) PairCamera(ctx context.Context, deviceName, setupCode strin
 
 	// Step 5: Discover accessory database to find characteristic IIDs.
 	c.logger.Info("fetching accessory database", "name", deviceName)
-	accessories, err := vc.Client.GetAccessories()
+	accessories, err := vc.Client.GetAccessoriesContext(ctx)
 	if err != nil {
 		vc.Client.Close()
 		return fmt.Errorf("get accessories: %w", err)
@@ -387,7 +395,7 @@ func (c *Controller) readControllerKeys() (controllerID string, ltsk ed25519.Pri
 // TCP connection has dropped (broken pipe, EOF, etc.). It discovers the
 // camera's current address via mDNS, performs pair-verify, and re-fetches
 // the accessory database to update characteristic IIDs.
-func (c *Controller) reconnect(deviceName string) error {
+func (c *Controller) reconnect(ctx context.Context, deviceName string) error {
 	c.logger.Info("reconnecting to camera", "name", deviceName)
 
 	controllerID, controllerLTSK, controllerLTPK, err := c.readControllerKeys()
@@ -431,19 +439,30 @@ func (c *Controller) reconnect(deviceName string) error {
 	var vc *VerifiedConn
 	var verifyErr error
 	for attempt := 1; attempt <= 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		vc, verifyErr = DoPairVerify(deviceAddr, controllerID, controllerLTSK, controllerLTPK, pairingInfo.PublicKey)
 		if verifyErr == nil {
 			break
 		}
 		c.logger.Warn("pair-verify attempt failed (reconnect)", "name", deviceName, "attempt", attempt, "error", verifyErr)
-		time.Sleep(time.Duration(attempt) * time.Second)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt) * time.Second):
+		}
 	}
 	if verifyErr != nil {
 		return fmt.Errorf("pair verify: %w", verifyErr)
 	}
+	if err := ctx.Err(); err != nil {
+		vc.Client.Close()
+		return err
+	}
 
 	c.logger.Info("fetching accessory database (reconnect)", "name", deviceName)
-	accessories, err := vc.Client.GetAccessories()
+	accessories, err := vc.Client.GetAccessoriesContext(ctx)
 	if err != nil {
 		vc.Client.Close()
 		return fmt.Errorf("get accessories: %w", err)
@@ -488,6 +507,9 @@ func isConnError(err error) bool {
 	return strings.Contains(s, "broken pipe") ||
 		strings.Contains(s, "connection reset") ||
 		strings.Contains(s, "EOF") ||
+		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "dial tcp") ||
+		strings.Contains(s, "HAP request timeout") ||
 		strings.Contains(s, "use of closed network connection")
 }
 
@@ -501,7 +523,22 @@ func isRecoverableStreamSetupError(err error) bool {
 	s := err.Error()
 	return strings.Contains(s, "read SetupEndpoints response") ||
 		strings.Contains(s, "SetupEndpoints response not ready") ||
+		strings.Contains(s, "write SelectedRTPStreamConfiguration") ||
+		strings.Contains(s, "camera rejected stream setup (status=2)") ||
 		strings.Contains(s, "HTTP 204")
+}
+
+func streamStartBackoff(failures int) time.Duration {
+	switch {
+	case failures <= 1:
+		return 15 * time.Second
+	case failures == 2:
+		return 30 * time.Second
+	case failures == 3:
+		return time.Minute
+	default:
+		return 2 * time.Minute
+	}
 }
 
 func (c *Controller) streamStartLock(deviceName string) *sync.Mutex {
@@ -515,6 +552,59 @@ func (c *Controller) streamStartLock(deviceName string) *sync.Mutex {
 	return lock
 }
 
+func (c *Controller) streamBackoffRemaining(deviceName string) (time.Duration, string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	state := c.streamRecovery[deviceName]
+	if state == nil || state.nextAttempt.IsZero() {
+		return 0, "", false
+	}
+	remaining := time.Until(state.nextAttempt)
+	if remaining <= 0 {
+		return 0, "", false
+	}
+	return remaining, state.lastError, true
+}
+
+func (c *Controller) recordStreamStartFailure(deviceName string, err error) {
+	if err == nil {
+		return
+	}
+
+	c.mu.Lock()
+	state := c.streamRecovery[deviceName]
+	if state == nil {
+		state = &streamStartRecovery{}
+		c.streamRecovery[deviceName] = state
+	}
+	state.failures++
+	delay := streamStartBackoff(state.failures)
+	state.nextAttempt = time.Now().Add(delay)
+	state.lastError = err.Error()
+	failures := state.failures
+	c.mu.Unlock()
+
+	c.logger.Warn("camera HomeKit stream setup entering backoff",
+		"name", deviceName,
+		"failures", failures,
+		"retry_in", delay,
+		"error", err)
+}
+
+func (c *Controller) recordStreamStartSuccess(deviceName string) {
+	c.mu.Lock()
+	state := c.streamRecovery[deviceName]
+	if state == nil || state.failures == 0 {
+		c.mu.Unlock()
+		return
+	}
+	delete(c.streamRecovery, deviceName)
+	c.mu.Unlock()
+
+	c.logger.Info("camera HomeKit stream setup recovered", "name", deviceName)
+}
+
 // StartStream initiates a camera stream and returns the stream response.
 // If the HAP connection or stream setup state looks stale, it automatically
 // reconnects only that camera and retries once.
@@ -523,13 +613,35 @@ func (c *Controller) StartStream(ctx context.Context, deviceName string, localIP
 	lock.Lock()
 	defer lock.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if remaining, lastErr, ok := c.streamBackoffRemaining(deviceName); ok {
+		return nil, fmt.Errorf("camera HomeKit stream setup in backoff for %s after previous failure: %s", remaining.Round(time.Second), lastErr)
+	}
+
 	resp, err := c.doStartStream(ctx, deviceName, localIP, videoPort, audioPort, videoConfig, audioConfig, preferredChannel)
 	if err != nil && isRecoverableStreamSetupError(err) {
 		c.logger.Warn("stream start failed with recoverable HAP error, reconnecting camera", "name", deviceName, "error", err)
-		if reconErr := c.reconnect(deviceName); reconErr != nil {
-			return nil, fmt.Errorf("reconnect failed: %w (original: %v)", reconErr, err)
+		if reconErr := c.reconnect(ctx, deviceName); reconErr != nil {
+			finalErr := fmt.Errorf("reconnect failed: %w (original: %v)", reconErr, err)
+			c.recordStreamStartFailure(deviceName, finalErr)
+			return nil, finalErr
 		}
-		return c.doStartStream(ctx, deviceName, localIP, videoPort, audioPort, videoConfig, audioConfig, preferredChannel)
+		resp, err = c.doStartStream(ctx, deviceName, localIP, videoPort, audioPort, videoConfig, audioConfig, preferredChannel)
+		if err != nil && isRecoverableStreamSetupError(err) {
+			c.recordStreamStartFailure(deviceName, err)
+			return nil, err
+		}
+		if err == nil {
+			c.recordStreamStartSuccess(deviceName)
+		}
+		return resp, err
+	}
+	if err == nil {
+		c.recordStreamStartSuccess(deviceName)
+	} else if isRecoverableStreamSetupError(err) {
+		c.recordStreamStartFailure(deviceName, err)
 	}
 	return resp, err
 }
@@ -595,6 +707,9 @@ func (c *Controller) doStartStream(ctx context.Context, deviceName string, local
 
 	var lastErr error
 	for attempt, option := range options {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		streamResp, err := c.tryStartStream(ctx, client, deviceName, option.ids, localIP, videoPort, audioPort, option.video, audioConfig)
 		if err == nil {
 			c.mu.Lock()
@@ -614,6 +729,10 @@ func (c *Controller) doStartStream(ctx context.Context, deviceName string, local
 }
 
 func (c *Controller) tryStartStream(ctx context.Context, client *HAPClient, deviceName string, ids cameraStreamCharIDs, localIP net.IP, videoPort, audioPort uint16, videoConfig VideoSelection, audioConfig AudioSelection) (*StreamResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Step 1: Generate stream endpoints with random SRTP keys.
 	ep, err := GenerateStreamEndpoints(localIP, videoPort, audioPort)
 	if err != nil {
@@ -628,11 +747,14 @@ func (c *Controller) tryStartStream(ctx context.Context, client *HAPClient, devi
 		"aid", ids.aid, "iid", ids.setupEndpointsIID,
 		"channel", ids.index, "localIP", localIP, "videoPort", videoPort, "audioPort", audioPort)
 
-	err = client.PutCharacteristics([]Characteristic{
+	err = client.PutCharacteristicsContext(ctx, []Characteristic{
 		{AID: ids.aid, IID: ids.setupEndpointsIID, Value: setupB64},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("write SetupEndpoints: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// Step 3: Read back SetupEndpoints to get camera's response. Some cameras
@@ -656,6 +778,9 @@ func (c *Controller) tryStartStream(ctx context.Context, client *HAPClient, devi
 	if streamResp.Status != 0 {
 		return nil, fmt.Errorf("camera rejected stream setup (status=%d)", streamResp.Status)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	c.logger.Info("stream setup accepted",
 		"name", deviceName,
@@ -677,7 +802,7 @@ func (c *Controller) tryStartStream(ctx context.Context, client *HAPClient, devi
 		"hex", fmt.Sprintf("%x", selectedTLV),
 		"base64", selectedB64)
 
-	err = client.PutCharacteristics([]Characteristic{
+	err = client.PutCharacteristicsContext(ctx, []Characteristic{
 		{AID: ids.aid, IID: ids.selectedConfigIID, Value: selectedB64},
 	})
 	if err != nil {

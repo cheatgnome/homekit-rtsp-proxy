@@ -3,6 +3,7 @@ package hap
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -165,7 +166,13 @@ type CharacteristicsResponse struct {
 
 // GetAccessories fetches the accessory database.
 func (c *HAPClient) GetAccessories() (*AccessoriesResponse, error) {
-	resp, err := c.doRequest("GET", "/accessories", nil)
+	return c.GetAccessoriesContext(context.Background())
+}
+
+// GetAccessoriesContext fetches the accessory database, aborting the HAP
+// connection if ctx is canceled while a request is in flight.
+func (c *HAPClient) GetAccessoriesContext(ctx context.Context) (*AccessoriesResponse, error) {
+	resp, err := c.doRequestContext(ctx, "GET", "/accessories", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -183,8 +190,14 @@ func (c *HAPClient) GetAccessories() (*AccessoriesResponse, error) {
 
 // GetCharacteristics reads characteristic values.
 func (c *HAPClient) GetCharacteristics(ids ...string) (*CharacteristicsResponse, error) {
+	return c.GetCharacteristicsContext(context.Background(), ids...)
+}
+
+// GetCharacteristicsContext reads characteristic values, aborting the HAP
+// connection if ctx is canceled while a request is in flight.
+func (c *HAPClient) GetCharacteristicsContext(ctx context.Context, ids ...string) (*CharacteristicsResponse, error) {
 	path := "/characteristics?id=" + strings.Join(ids, ",")
-	resp, err := c.doRequest("GET", path, nil)
+	resp, err := c.doRequestContext(ctx, "GET", path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -202,13 +215,19 @@ func (c *HAPClient) GetCharacteristics(ids ...string) (*CharacteristicsResponse,
 
 // PutCharacteristics writes characteristic values.
 func (c *HAPClient) PutCharacteristics(chars []Characteristic) error {
+	return c.PutCharacteristicsContext(context.Background(), chars)
+}
+
+// PutCharacteristicsContext writes characteristic values, aborting the HAP
+// connection if ctx is canceled while a request is in flight.
+func (c *HAPClient) PutCharacteristicsContext(ctx context.Context, chars []Characteristic) error {
 	req := CharacteristicsRequest{Characteristics: chars}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
 
-	resp, err := c.doRequest("PUT", "/characteristics", body)
+	resp, err := c.doRequestContext(ctx, "PUT", "/characteristics", body)
 	if err != nil {
 		return err
 	}
@@ -256,6 +275,10 @@ func (c *HAPClient) Events() <-chan *CharacteristicsResponse {
 // doRequest sends an HTTP request and waits for the buffered response.
 // Only one request can be in-flight at a time.
 func (c *HAPClient) doRequest(method, path string, body []byte) (*bufferedResponse, error) {
+	return c.doRequestContext(context.Background(), method, path, body)
+}
+
+func (c *HAPClient) doRequestContext(ctx context.Context, method, path string, body []byte) (*bufferedResponse, error) {
 	c.reqMu.Lock()
 	defer c.reqMu.Unlock()
 
@@ -284,6 +307,9 @@ func (c *HAPClient) doRequest(method, path string, body []byte) (*bufferedRespon
 		return result.resp, nil
 	case <-time.After(30 * time.Second):
 		return nil, fmt.Errorf("HAP request timeout after 30s")
+	case <-ctx.Done():
+		c.Close()
+		return nil, ctx.Err()
 	case <-c.done:
 		return nil, fmt.Errorf("HAP connection closed")
 	}

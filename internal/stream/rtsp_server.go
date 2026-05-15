@@ -64,6 +64,14 @@ type RTSPServer struct {
 	// the ONVIF /snapshot.jpg endpoint. Refreshed each time a new IDR is
 	// fully assembled in the cache.
 	snapshotter *Snapshotter
+
+	rtspSessions map[*gortsplib.ServerSession]*rtspSessionState
+}
+
+type rtspSessionState struct {
+	playing bool
+	counted bool
+	closed  bool
 }
 
 // RTSPServerConfig configures the RTSP server.
@@ -93,6 +101,7 @@ func NewRTSPServer(cfg RTSPServerConfig, session *Session, logger *slog.Logger) 
 		path:        cfg.Path,
 		idrReady:    make(chan struct{}),
 		snapshotter: snap,
+		rtspSessions: make(map[*gortsplib.ServerSession]*rtspSessionState),
 	}
 
 	// Build SDP with H.264 video.
@@ -567,12 +576,27 @@ func (s *RTSPServer) OnConnClose(ctx *gortsplib.ServerHandlerOnConnCloseCtx) {
 
 func (s *RTSPServer) OnSessionOpen(ctx *gortsplib.ServerHandlerOnSessionOpenCtx) {
 	s.logger.Debug("RTSP session opened")
+	s.mu.Lock()
+	s.rtspSessions[ctx.Session] = &rtspSessionState{}
+	s.mu.Unlock()
 }
 
 func (s *RTSPServer) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseCtx) {
 	s.logger.Debug("RTSP session closed")
-	if err := s.session.ClientDisconnected(); err != nil {
-		s.logger.Error("session client disconnected error", "error", err)
+
+	counted := false
+	s.mu.Lock()
+	if st := s.rtspSessions[ctx.Session]; st != nil {
+		st.closed = true
+		counted = st.counted
+		delete(s.rtspSessions, ctx.Session)
+	}
+	s.mu.Unlock()
+
+	if counted {
+		if err := s.session.ClientDisconnected(); err != nil {
+			s.logger.Error("session client disconnected error", "error", err)
+		}
 	}
 
 	if s.session.State() == StateIdle {
@@ -597,20 +621,91 @@ func (s *RTSPServer) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Resp
 	}, s.stream, nil
 }
 
+func (s *RTSPServer) markRTSPPlaying(sess *gortsplib.ServerSession) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	st := s.rtspSessions[sess]
+	if st == nil {
+		st = &rtspSessionState{}
+		s.rtspSessions[sess] = st
+	}
+	if st.closed {
+		delete(s.rtspSessions, sess)
+		return false
+	}
+	st.playing = true
+	return true
+}
+
+func (s *RTSPServer) markRTSPCounted(sess *gortsplib.ServerSession) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	st := s.rtspSessions[sess]
+	if st == nil || st.closed {
+		delete(s.rtspSessions, sess)
+		return false
+	}
+	if st.counted {
+		return false
+	}
+	st.counted = true
+	return true
+}
+
+func (s *RTSPServer) markRTSPUncounted(sess *gortsplib.ServerSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	st := s.rtspSessions[sess]
+	if st == nil {
+		return
+	}
+	st.counted = false
+	st.playing = false
+	if st.closed {
+		delete(s.rtspSessions, sess)
+	}
+}
+
+func (s *RTSPServer) rtspSessionClosed(sess *gortsplib.ServerSession) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	st := s.rtspSessions[sess]
+	return st == nil || st.closed
+}
+
 func (s *RTSPServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
+	if !s.markRTSPPlaying(ctx.Session) {
+		return &base.Response{
+			StatusCode: base.StatusOK,
+		}, nil
+	}
+
 	// Start the camera asynchronously. We must return from OnPlay before
 	// gortsplib will register this client as an active reader. If we start
 	// the camera synchronously (~170ms HAP exchange), the first RTP packets
 	// (STAP-A with SPS/PPS + IDR frame) arrive before the reader is
 	// registered and get silently dropped.
-	go func() {
+	go func(sess *gortsplib.ServerSession) {
 		// Wait for gortsplib to finish initializing the TCP writer.
 		// The writer is started asynchronously after the PLAY response is sent.
 		time.Sleep(100 * time.Millisecond)
 
+		if !s.markRTSPCounted(sess) {
+			return
+		}
+
 		freshStart, err := s.session.ClientConnected()
 		if err != nil {
+			s.markRTSPUncounted(sess)
 			s.logger.Error("failed to start stream for client", "error", err)
+			return
+		}
+
+		if s.rtspSessionClosed(sess) {
 			return
 		}
 
@@ -624,6 +719,10 @@ func (s *RTSPServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respon
 		case <-s.idrReady:
 		case <-time.After(10 * time.Second):
 			s.logger.Warn("timeout waiting for IDR cache in OnPlay")
+			return
+		}
+
+		if s.rtspSessionClosed(sess) {
 			return
 		}
 
@@ -656,7 +755,7 @@ func (s *RTSPServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respon
 				"packets", len(cache), "startSeq", startSeq, "ts", idrTS)
 		}
 		s.videoWriteMu.Unlock()
-	}()
+	}(ctx.Session)
 
 	return &base.Response{
 		StatusCode: base.StatusOK,
