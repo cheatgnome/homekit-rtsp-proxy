@@ -23,7 +23,7 @@ HomeKit cameras expose streams only through the proprietary HAP/SRTP protocol. T
 
 - Recording, storage, or playback
 - Camera PTZ control
-- Two-way audio (talkback) — silence packets are sent to satisfy the protocol, but real audio return is not implemented
+- Audio transcoding for arbitrary talkback input — ONVIF RTSP backchannel G.711 PCMU is transcoded to HomeKit AAC-ELD; other client input codecs are not currently converted
 - Camera firmware updates or HomeKit accessory management
 - Cloud connectivity
 
@@ -387,6 +387,7 @@ type CameraConfig struct {
 | `audio.codec` | `"aac-eld"` |
 | `audio.sample_rate` | `16000` (Hz) |
 | `audio.gain` | `512` (~54dB amplification) |
+| `audio.talkback_gain` | `1` (unchanged talkback input) |
 | `onvif.enabled` | `false` |
 | `onvif.port` | `8580` |
 
@@ -503,7 +504,7 @@ type SRTPProxy struct {
     videoDecryptCtx            *srtp.Context      // Camera's keys
     audioDecryptCtx            *srtp.Context      // Camera's keys
     srtcpEncryptCtx            *srtp.Context      // Controller's keys (for RTCP replies)
-    audioReturnCtx             *srtp.Context      // Controller's keys (for silence packets)
+    audioReturnCtx             *srtp.Context      // Controller's keys (for talkback/keepalive)
     onVideoRTP, onAudioRTP     func(*rtp.Packet)  // Callbacks
 }
 ```
@@ -515,9 +516,9 @@ type SRTPProxy struct {
 | `readVideoLoop` | Continuous | Receive + decrypt SRTP video, demux RTCP |
 | `readAudioLoop` | Continuous | Receive + decrypt SRTP audio |
 | `rtcpKeepaliveLoop` | 500ms | Send encrypted ReceiverReports to camera |
-| `audioReturnLoop` | 20ms | Send encrypted silence packets to camera |
+| `audioReturnLoop` | 1s fallback | Send encrypted silence keepalives when no talkback audio is active |
 
-**Why audio return is required:** HomeKit cameras expect bidirectional audio. Without return packets, some cameras stop streaming after a timeout. Silence packets (4 bytes of zeros) satisfy this requirement with negligible bandwidth.
+**Why audio return is required:** HomeKit cameras expect bidirectional audio. RTSP backchannel G.711 PCMU is gain-adjusted with `audio.talkback_gain`, peak-limited to avoid clipping, transcoded to AAC-ELD, encrypted with the controller audio SRTP key, and sent to the camera. A low-rate silence fallback keeps cameras that dislike an entirely idle return path from timing out, and backs off while real talkback audio is active.
 
 **Why RTCP keepalive is required:** HomeKit cameras expect periodic ReceiverReports (matching the negotiated 0.5s RTCPInterval). Without them, the camera tears down the stream.
 
@@ -726,7 +727,7 @@ type PullPointSubscription struct {
 | 4 | SRTP video reader | While streaming | Decrypt + dispatch video RTP |
 | 5 | SRTP audio reader | While streaming | Decrypt + dispatch audio RTP |
 | 6 | RTCP keepalive | While streaming | Send ReceiverReports every 500ms |
-| 7 | Audio return | While streaming | Send silence packets every 20ms |
+| 7 | Audio return | While streaming | Forward talkback RTP; send low-rate fallback silence |
 | 8 | IDR injector | Per RTSP client | Inject cached keyframes (short-lived) |
 | 9 | ONVIF HTTP server | Process lifetime | Handle SOAP requests |
 | 10 | ONVIF cleanup | Process lifetime | Expire stale subscriptions every 60s |

@@ -10,9 +10,9 @@ import (
 )
 
 type Config struct {
-	LogLevel     string         `yaml:"log_level"`
-	PairingStore string         `yaml:"pairing_store"`
-	BindAddress  string         `yaml:"bind_address"`
+	LogLevel     string `yaml:"log_level"`
+	PairingStore string `yaml:"pairing_store"`
+	BindAddress  string `yaml:"bind_address"`
 	// ListenAddress restricts the RTSP and ONVIF listeners to a specific
 	// interface (e.g. "127.0.0.1" to expose them only to local consumers).
 	// Empty = bind to all interfaces (default). BindAddress is unaffected
@@ -46,10 +46,11 @@ type VideoConfig struct {
 }
 
 type AudioConfig struct {
-	Enabled    bool   `yaml:"enabled"`
-	Codec      string `yaml:"codec"`
-	SampleRate int    `yaml:"sample_rate"`
-	Gain       *int   `yaml:"gain"` // PCM gain factor applied during AAC-ELD→AAC-LC transcoding (0 = mute, 512 = ~54dB)
+	Enabled      bool   `yaml:"enabled"`
+	Codec        string `yaml:"codec"`
+	SampleRate   int    `yaml:"sample_rate"`
+	Gain         *int   `yaml:"gain"`          // PCM gain factor applied during AAC-ELD→AAC-LC transcoding (0 = mute, 512 = ~54dB)
+	TalkbackGain *int   `yaml:"talkback_gain"` // PCM gain factor applied to RTSP talkback before AAC-ELD encoding (1 = unchanged)
 }
 
 type ONVIFConfig struct {
@@ -121,6 +122,9 @@ func applyDefaults(c *CameraConfig) {
 	}
 	if c.Audio.Gain == nil {
 		c.Audio.Gain = intPtr(512)
+	}
+	if c.Audio.TalkbackGain == nil {
+		c.Audio.TalkbackGain = intPtr(1)
 	}
 	if c.ONVIF.Port == 0 {
 		c.ONVIF.Port = 8580

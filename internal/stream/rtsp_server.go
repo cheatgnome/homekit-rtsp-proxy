@@ -30,11 +30,12 @@ type RTSPServer struct {
 	desc       *description.Session
 	medias     []*description.Media
 
-	videoFormat  *format.H264
-	audioFormat  format.Format
-	audioPT      uint8 // payload type for audio rewriting
-	videoCount   uint64
-	gotParams   bool // true once SPS/PPS have been extracted
+	videoFormat   *format.H264
+	audioFormat   format.Format
+	talkbackMedia *description.Media
+	audioPT       uint8 // payload type for audio rewriting
+	videoCount    uint64
+	gotParams     bool // true once SPS/PPS have been extracted
 
 	// videoWriteMu serializes all video writes (normal + IDR injection) to
 	// prevent interleaving. Covers seq/ts assignment through WritePacketRTP.
@@ -57,8 +58,18 @@ type RTSPServer struct {
 	collectingIDR bool          // true while collecting IDR FU-A fragments
 
 	// Audio transcoder: AAC-ELD → AAC-LC (nil if audio disabled or non-ELD codec).
-	transcoder *AudioTranscoder
-	audioSeq   uint16 // monotonic audio seq counter (transcoding changes packet count)
+	transcoder          *AudioTranscoder
+	audioSeq            uint16 // monotonic audio seq counter (transcoding changes packet count)
+	talkbackTranscoder  *TalkbackTranscoder
+	talkbackQueue       chan []byte
+	talkbackStop        chan struct{}
+	talkbackStopOnce    sync.Once
+	talkbackWG          sync.WaitGroup
+	talkbackSeq         uint16
+	talkbackTS          uint32
+	talkbackPacketCount uint64
+	talkbackDropped     uint64
+	onTalkbackRTP       func(*rtp.Packet)
 
 	// Snapshotter: decodes the cached IDR into a JPEG kept in memory for
 	// the ONVIF /snapshot.jpg endpoint. Refreshed each time a new IDR is
@@ -83,6 +94,8 @@ type RTSPServerConfig struct {
 	AudioCodec    string // "aac-eld" or "opus"
 	SampleRate    int
 	AudioGain     int // PCM gain factor for AAC-ELD→AAC-LC transcoding
+	TalkbackGain  int // PCM gain factor for RTSP talkback before AAC-ELD encoding
+	OnTalkbackRTP func(*rtp.Packet)
 }
 
 // NewRTSPServer creates a new RTSP server for a single camera.
@@ -94,14 +107,15 @@ func NewRTSPServer(cfg RTSPServerConfig, session *Session, logger *slog.Logger) 
 	}
 
 	s := &RTSPServer{
-		logger:      logger,
-		session:     session,
-		listenAddr:  cfg.ListenAddress,
-		port:        cfg.Port,
-		path:        cfg.Path,
-		idrReady:    make(chan struct{}),
-		snapshotter: snap,
-		rtspSessions: make(map[*gortsplib.ServerSession]*rtspSessionState),
+		logger:        logger,
+		session:       session,
+		listenAddr:    cfg.ListenAddress,
+		port:          cfg.Port,
+		path:          cfg.Path,
+		idrReady:      make(chan struct{}),
+		snapshotter:   snap,
+		rtspSessions:  make(map[*gortsplib.ServerSession]*rtspSessionState),
+		onTalkbackRTP: cfg.OnTalkbackRTP,
 	}
 
 	// Build SDP with H.264 video.
@@ -114,6 +128,7 @@ func NewRTSPServer(cfg RTSPServerConfig, session *Session, logger *slog.Logger) 
 
 	videoMedia := &description.Media{
 		Type:    description.MediaTypeVideo,
+		Control: "trackID=0",
 		Formats: []format.Format{s.videoFormat},
 	}
 	s.medias = []*description.Media{videoMedia}
@@ -180,9 +195,38 @@ func NewRTSPServer(cfg RTSPServerConfig, session *Session, logger *slog.Logger) 
 
 		audioMedia := &description.Media{
 			Type:    description.MediaTypeAudio,
+			Control: "trackID=1",
 			Formats: []format.Format{s.audioFormat},
 		}
 		s.medias = append(s.medias, audioMedia)
+
+		talkbackFormat := buildTalkbackAudioFormat(cfg.AudioCodec)
+		if cfg.AudioCodec != "opus" {
+			talkbackTranscoder, err := NewTalkbackTranscoder(sampleRate, cfg.TalkbackGain)
+			if err != nil {
+				logger.Warn("failed to create talkback transcoder; raw backchannel forwarding only", "error", err)
+			} else {
+				s.talkbackTranscoder = talkbackTranscoder
+				logger.Info("talkback transcoder initialized",
+					"codec", "G.711 PCMU → AAC-ELD",
+					"sampleRate", sampleRate,
+					"gain", talkbackTranscoder.gain,
+					"encoderFrameSamples", talkbackTranscoder.encFrameSize,
+					"rtpFrameSamples", talkbackTranscoder.rtpFrameSamples,
+					"packetTime", talkbackTranscoder.FrameDuration())
+				if cfg.OnTalkbackRTP != nil {
+					s.talkbackQueue = make(chan []byte, 200)
+					s.talkbackStop = make(chan struct{})
+				}
+			}
+		}
+		s.talkbackMedia = &description.Media{
+			Type:          description.MediaTypeAudio,
+			IsBackChannel: true,
+			Control:       "trackID=2",
+			Formats:       []format.Format{talkbackFormat},
+		}
+		s.medias = append(s.medias, s.talkbackMedia)
 	}
 
 	s.desc = &description.Session{
@@ -190,6 +234,22 @@ func NewRTSPServer(cfg RTSPServerConfig, session *Session, logger *slog.Logger) 
 	}
 
 	return s
+}
+
+func buildTalkbackAudioFormat(codec string) format.Format {
+	if codec == "opus" {
+		return &format.Opus{
+			PayloadTyp:   110,
+			ChannelCount: 1,
+		}
+	}
+
+	return &format.G711{
+		PayloadTyp:   0,
+		MULaw:        true,
+		SampleRate:   8000,
+		ChannelCount: 1,
+	}
 }
 
 // Start begins listening for RTSP connections.
@@ -213,6 +273,11 @@ func (s *RTSPServer) Start() error {
 	if err := s.stream.Initialize(); err != nil {
 		s.server.Close()
 		return fmt.Errorf("initialize server stream: %w", err)
+	}
+
+	if s.talkbackQueue != nil && s.talkbackTranscoder != nil {
+		s.talkbackWG.Add(1)
+		go s.talkbackSenderLoop()
 	}
 
 	s.logger.Info("RTSP server started", "port", s.port, "path", s.path)
@@ -514,7 +579,7 @@ func (s *RTSPServer) WriteAudioPacket(pkt *rtp.Packet) {
 		// Build new 4-byte AU header for the AAC-LC frame.
 		// Format: 2 bytes AU-headers-length (16 bits = count of AU header bits),
 		//         2 bytes AU header (13-bit size + 3-bit index).
-		auHeaderLen := uint16(16) // one AU header = 16 bits
+		auHeaderLen := uint16(16)           // one AU header = 16 bits
 		auHeader := uint16(len(rawLC)) << 3 // 13-bit size, index=0
 
 		newPayload := make([]byte, 4+len(rawLC))
@@ -539,14 +604,96 @@ func (s *RTSPServer) WriteAudioPacket(pkt *rtp.Packet) {
 	stream.WritePacketRTP(s.medias[1], pkt)
 }
 
+func (s *RTSPServer) talkbackSenderLoop() {
+	defer s.talkbackWG.Done()
+
+	frameDuration := s.talkbackTranscoder.FrameDuration()
+	if frameDuration <= 0 {
+		frameDuration = 30 * time.Millisecond
+	}
+	ticker := time.NewTicker(frameDuration)
+	defer ticker.Stop()
+
+	s.logger.Info("talkback RTP pacer started",
+		"packetTime", frameDuration,
+		"rtpFrameSamples", s.talkbackTranscoder.rtpFrameSamples)
+
+	for {
+		select {
+		case <-s.talkbackStop:
+			return
+		case <-ticker.C:
+			select {
+			case payload := <-s.talkbackQueue:
+				s.sendTalkbackPayload(payload)
+			default:
+			}
+		}
+	}
+}
+
+func (s *RTSPServer) enqueueTalkbackPayload(payload []byte) {
+	if s.talkbackQueue == nil {
+		s.sendTalkbackPayload(payload)
+		return
+	}
+
+	select {
+	case s.talkbackQueue <- payload:
+		return
+	default:
+	}
+
+	s.talkbackDropped++
+	select {
+	case <-s.talkbackQueue:
+	default:
+	}
+	select {
+	case s.talkbackQueue <- payload:
+	default:
+	}
+}
+
+func (s *RTSPServer) sendTalkbackPayload(payload []byte) {
+	if s.onTalkbackRTP == nil || s.talkbackTranscoder == nil {
+		return
+	}
+
+	out := &rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			Marker:         true,
+			PayloadType:    110,
+			SequenceNumber: s.talkbackSeq,
+			Timestamp:      s.talkbackTS,
+		},
+		Payload: payload,
+	}
+	s.talkbackSeq++
+	s.talkbackTS += uint32(s.talkbackTranscoder.rtpFrameSamples)
+	s.onTalkbackRTP(out)
+}
+
 // Stop shuts down the RTSP server.
 func (s *RTSPServer) Stop() {
+	if s.talkbackStop != nil {
+		s.talkbackStopOnce.Do(func() {
+			close(s.talkbackStop)
+		})
+		s.talkbackWG.Wait()
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.transcoder != nil {
 		s.transcoder.Close()
 		s.transcoder = nil
+	}
+	if s.talkbackTranscoder != nil {
+		s.talkbackTranscoder.Close()
+		s.talkbackTranscoder = nil
 	}
 
 	if s.snapshotter != nil {
@@ -565,6 +712,22 @@ func (s *RTSPServer) Stop() {
 }
 
 // gortsplib.ServerHandler implementation
+
+func (s *RTSPServer) OnRequest(_ *gortsplib.ServerConn, req *base.Request) {
+	switch req.Method {
+	case base.Describe, base.Setup, base.Play, base.Announce, base.Record, base.GetParameter:
+		url := ""
+		if req.URL != nil {
+			url = req.URL.String()
+		}
+		s.logger.Info("RTSP request",
+			"method", req.Method,
+			"url", url,
+			"require", req.Header["Require"],
+			"transport", req.Header["Transport"],
+			"content_type", req.Header["Content-Type"])
+	}
+}
 
 func (s *RTSPServer) OnConnOpen(ctx *gortsplib.ServerHandlerOnConnOpenCtx) {
 	s.logger.Info("RTSP connection opened", "remote", ctx.Conn.NetConn().RemoteAddr())
@@ -616,6 +779,17 @@ func (s *RTSPServer) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*bas
 }
 
 func (s *RTSPServer) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error) {
+	s.logger.Info("RTSP setup",
+		"path", ctx.Path,
+		"state", ctx.Session.State(),
+		"transport", ctx.Request.Header["Transport"])
+
+	if ctx.Session.State() == gortsplib.ServerSessionStatePreRecord {
+		return &base.Response{
+			StatusCode: base.StatusOK,
+		}, nil, nil
+	}
+
 	return &base.Response{
 		StatusCode: base.StatusOK,
 	}, s.stream, nil
@@ -677,7 +851,32 @@ func (s *RTSPServer) rtspSessionClosed(sess *gortsplib.ServerSession) bool {
 	return st == nil || st.closed
 }
 
+func (s *RTSPServer) sessionHasForwardMedia(sess *gortsplib.ServerSession) bool {
+	for _, medi := range sess.Medias() {
+		if medi.Type == description.MediaTypeAudio && (medi.IsBackChannel || medi == s.talkbackMedia) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (s *RTSPServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
+	s.registerTalkbackCallbacks(ctx.Session, false)
+	s.logger.Info("RTSP play",
+		"path", ctx.Path,
+		"medias", len(ctx.Session.Medias()),
+		"talkback_advertised", s.talkbackMedia != nil)
+
+	if !s.sessionHasForwardMedia(ctx.Session) {
+		return &base.Response{
+			StatusCode: base.StatusOK,
+			Header: base.Header{
+				"Range": base.HeaderValue{"npt=0.000-"},
+			},
+		}, nil
+	}
+
 	if !s.markRTSPPlaying(ctx.Session) {
 		return &base.Response{
 			StatusCode: base.StatusOK,
@@ -763,4 +962,94 @@ func (s *RTSPServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respon
 			"Range": base.HeaderValue{"npt=0.000-"},
 		},
 	}, nil
+}
+
+func (s *RTSPServer) OnAnnounce(ctx *gortsplib.ServerHandlerOnAnnounceCtx) (*base.Response, error) {
+	if s.onTalkbackRTP == nil {
+		return &base.Response{StatusCode: base.StatusNotImplemented}, nil
+	}
+	for _, medi := range ctx.Description.Medias {
+		if medi.Type == description.MediaTypeAudio {
+			s.logger.Info("RTSP talk-back publisher announced", "path", ctx.Path)
+			return &base.Response{StatusCode: base.StatusOK}, nil
+		}
+	}
+	return &base.Response{StatusCode: base.StatusBadRequest}, fmt.Errorf("talk-back ANNOUNCE must contain an audio media")
+}
+
+func (s *RTSPServer) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Response, error) {
+	if s.onTalkbackRTP == nil {
+		return &base.Response{StatusCode: base.StatusNotImplemented}, nil
+	}
+
+	if s.markRTSPCounted(ctx.Session) {
+		if _, err := s.session.ClientConnected(); err != nil {
+			s.markRTSPUncounted(ctx.Session)
+			return &base.Response{StatusCode: base.StatusInternalServerError}, err
+		}
+	}
+
+	s.registerTalkbackCallbacks(ctx.Session, true)
+	s.logger.Info("RTSP talk-back recording started", "path", ctx.Path)
+	return &base.Response{StatusCode: base.StatusOK}, nil
+}
+
+func (s *RTSPServer) OnGetParameter(ctx *gortsplib.ServerHandlerOnGetParameterCtx) (*base.Response, error) {
+	s.logger.Debug("RTSP GET_PARAMETER", "path", ctx.Path)
+	return &base.Response{StatusCode: base.StatusOK}, nil
+}
+
+func (s *RTSPServer) registerTalkbackCallbacks(sess *gortsplib.ServerSession, allowPublishedAudio bool) {
+	if s.onTalkbackRTP == nil {
+		return
+	}
+	sess.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
+		if medi.Type != description.MediaTypeAudio {
+			return
+		}
+		if !allowPublishedAudio && s.talkbackMedia != nil && medi != s.talkbackMedia && !medi.IsBackChannel {
+			return
+		}
+		s.handleTalkbackPacket(forma, pkt)
+	})
+}
+
+func (s *RTSPServer) handleTalkbackPacket(forma format.Format, pkt *rtp.Packet) {
+	s.talkbackPacketCount++
+	count := s.talkbackPacketCount
+
+	if g711, ok := forma.(*format.G711); ok && s.talkbackTranscoder != nil {
+		payloads, inPeakPCM, outPeakPCM, err := s.talkbackTranscoder.TranscodeG711(pkt.Payload, g711.MULaw)
+		if err != nil {
+			s.logger.Warn("talkback transcode error", "error", err)
+			return
+		}
+		for _, payload := range payloads {
+			s.enqueueTalkbackPayload(payload)
+		}
+		if count == 1 || count%50 == 0 {
+			expectedFrames := len(pkt.Payload) * s.talkbackTranscoder.sampleRate / 8000 / s.talkbackTranscoder.encFrameSize
+			s.logger.Info("RTSP talkback RTP received",
+				"packets", count,
+				"codec", forma.Codec(),
+				"in_payload", len(pkt.Payload),
+				"out_frames", len(payloads),
+				"expected_frames", expectedFrames,
+				"in_peak_pcm", inPeakPCM,
+				"out_peak_pcm", outPeakPCM,
+				"gain", s.talkbackTranscoder.gain,
+				"encoder_frame_samples", s.talkbackTranscoder.encFrameSize,
+				"queued_frames", len(s.talkbackQueue),
+				"dropped_queued_frames", s.talkbackDropped)
+		}
+		return
+	}
+
+	if count == 1 || count%50 == 0 {
+		s.logger.Info("RTSP talkback RTP received",
+			"packets", count,
+			"codec", forma.Codec(),
+			"payload", len(pkt.Payload))
+	}
+	s.onTalkbackRTP(pkt)
 }

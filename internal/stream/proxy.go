@@ -31,6 +31,7 @@ type SRTPProxy struct {
 
 	// Audio return SRTP context (controller's keys, for encrypting outgoing audio).
 	audioReturnCtx *srtp.Context
+	audioSRTCPCtx  *srtp.Context
 
 	// Camera's remote addresses.
 	cameraAddr      *net.UDPAddr
@@ -42,21 +43,29 @@ type SRTPProxy struct {
 	audioReturnSSRC uint32 // our own audio SSRC
 
 	// Audio return state.
-	audioReturnSeq uint16
-	audioReturnTS  uint32
+	audioReturnMu           sync.Mutex
+	audioReturnSeq          uint16
+	audioReturnTS           uint32
+	audioReturnInputBaseTS  uint32
+	audioReturnOutputBaseTS uint32
+	audioReturnHaveInputTS  bool
+	lastTalkbackPacket      time.Time
+	talkbackPacketsSent     uint64
+	audioReturnPacketsSent  uint32
+	audioReturnOctetsSent   uint32
 
 	// Track highest received video seq for ReceptionReport.
-	rtcpMu                sync.Mutex
-	videoSeqInitialized   bool
-	videoBaseSeq          uint16
-	videoMaxSeq           uint16
-	videoSeqCycles        uint32
-	videoPacketsReceived  uint32
-	highestVideoSeq       uint32
+	rtcpMu               sync.Mutex
+	videoSeqInitialized  bool
+	videoBaseSeq         uint16
+	videoMaxSeq          uint16
+	videoSeqCycles       uint32
+	videoPacketsReceived uint32
+	highestVideoSeq      uint32
 
 	// Callbacks for forwarding decrypted packets.
-	onVideoRTP func(*rtp.Packet)
-	onAudioRTP func(*rtp.Packet)
+	onVideoRTP   func(*rtp.Packet)
+	onAudioRTP   func(*rtp.Packet)
 	onVideoStats func(VideoStats)
 
 	stopCh chan struct{}
@@ -184,7 +193,7 @@ func (p *SRTPProxy) Start(cfg SRTPConfig) error {
 		}
 	}
 
-	// Create audio return SRTP context using the CONTROLLER's audio keys.
+	// Create audio return SRTP/SRTCP contexts using the CONTROLLER's audio keys.
 	if len(cfg.ControllerAudioKey) > 0 {
 		p.audioReturnCtx, err = srtp.CreateContext(
 			cfg.ControllerAudioKey, cfg.ControllerAudioSalt,
@@ -192,6 +201,13 @@ func (p *SRTPProxy) Start(cfg SRTPConfig) error {
 		)
 		if err != nil {
 			p.logger.Warn("failed to create audio return context", "error", err)
+		}
+		p.audioSRTCPCtx, err = srtp.CreateContext(
+			cfg.ControllerAudioKey, cfg.ControllerAudioSalt,
+			srtp.ProtectionProfileAes128CmHmacSha1_80,
+		)
+		if err != nil {
+			p.logger.Warn("failed to create audio SRTCP context", "error", err)
 		}
 	}
 
@@ -201,13 +217,23 @@ func (p *SRTPProxy) Start(cfg SRTPConfig) error {
 	p.controllerSSRC = cfg.ControllerVideoSSRC
 	p.cameraVideoSSRC = cfg.VideoSSRC
 	p.audioReturnSSRC = cfg.ControllerAudioSSRC
+	p.audioReturnSeq = 0
+	p.audioReturnTS = 0
+	p.audioReturnInputBaseTS = 0
+	p.audioReturnOutputBaseTS = 0
+	p.audioReturnHaveInputTS = false
+	p.lastTalkbackPacket = time.Time{}
+	p.talkbackPacketsSent = 0
+	p.audioReturnPacketsSent = 0
+	p.audioReturnOctetsSent = 0
 
 	// Start goroutines.
-	p.wg.Add(4)
+	p.wg.Add(5)
 	go p.readVideoLoop()
 	go p.readAudioLoop()
 	go p.rtcpKeepaliveLoop()
 	go p.audioReturnLoop()
+	go p.audioRTCPReportLoop()
 
 	p.logger.Info("SRTP proxy started",
 		"video_port", p.videoConn.LocalAddr().(*net.UDPAddr).Port,
@@ -229,8 +255,8 @@ func (p *SRTPProxy) readVideoLoop() {
 	var videoCount, rtcpCount, dropCount, decryptErrors, droppedFrames uint64
 	var lastSeq uint16
 	var lastFrameTS uint32
-	var frameGapped bool          // true if current frame has a sequence gap
-	var frameBuf []*rtp.Packet    // buffered packets for current frame
+	var frameGapped bool       // true if current frame has a sequence gap
+	var frameBuf []*rtp.Packet // buffered packets for current frame
 	lastLogTime := time.Now()
 	var lastStatsPackets, lastStatsDrops, lastStatsDroppedFrames uint64
 
@@ -614,9 +640,9 @@ func (p *SRTPProxy) sendRTCPKeepalive() {
 		"addr", p.cameraAddr)
 }
 
-// audioReturnLoop sends periodic silence SRTP packets to the camera's audio
-// port. HomeKit cameras expect bidirectional audio - we must send something
-// to prevent the camera from stopping the stream.
+// audioReturnLoop sends low-rate silence SRTP packets to the camera's audio
+// port only as a keepalive fallback. Real talk-back packets sent through
+// SendAudioReturnPacket suppress the fallback while talk-back is active.
 func (p *SRTPProxy) audioReturnLoop() {
 	defer p.wg.Done()
 
@@ -629,8 +655,10 @@ func (p *SRTPProxy) audioReturnLoop() {
 		"cameraAudioAddr", p.cameraAudioAddr,
 		"ssrc", p.audioReturnSSRC)
 
-	// Send silence every 20ms (50 packets/sec).
-	ticker := time.NewTicker(20 * time.Millisecond)
+	// Some HomeKit cameras stop the stream when the return path is completely
+	// idle. Keep the path warm at low rate, then back off while real talk-back
+	// audio is flowing.
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	silencePayload := []byte{0x00, 0x00, 0x00, 0x00}
@@ -640,25 +668,158 @@ func (p *SRTPProxy) audioReturnLoop() {
 		case <-p.stopCh:
 			return
 		case <-ticker.C:
-			p.sendAudioReturn(silencePayload)
+			if p.talkbackActive() {
+				continue
+			}
+			p.sendAudioReturn(silencePayload, true, p.reserveSilenceTimestamp())
 		}
 	}
 }
 
+func (p *SRTPProxy) audioRTCPReportLoop() {
+	defer p.wg.Done()
+
+	if p.audioSRTCPCtx == nil || p.cameraAudioAddr == nil || p.audioConn == nil {
+		return
+	}
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-ticker.C:
+			if p.talkbackActive() {
+				p.sendAudioSenderReport()
+			}
+		}
+	}
+}
+
+func (p *SRTPProxy) reserveSilenceTimestamp() uint32 {
+	p.audioReturnMu.Lock()
+	defer p.audioReturnMu.Unlock()
+
+	timestamp := p.audioReturnTS
+	p.audioReturnTS += 320
+	return timestamp
+}
+
+func (p *SRTPProxy) talkbackActive() bool {
+	p.audioReturnMu.Lock()
+	defer p.audioReturnMu.Unlock()
+	return !p.lastTalkbackPacket.IsZero() && time.Since(p.lastTalkbackPacket) < 2*time.Second
+}
+
+func (p *SRTPProxy) audioReturnStatsSnapshot() (rtpTime uint32, packets uint32, octets uint32) {
+	p.audioReturnMu.Lock()
+	defer p.audioReturnMu.Unlock()
+	return p.audioReturnTS, p.audioReturnPacketsSent, p.audioReturnOctetsSent
+}
+
+func (p *SRTPProxy) sendAudioSenderReport() {
+	rtpTime, packets, octets := p.audioReturnStatsSnapshot()
+	now := time.Now()
+	ntp := toNTPTime(now)
+
+	sr := &rtcp.SenderReport{
+		SSRC:        p.audioReturnSSRC,
+		NTPTime:     ntp,
+		RTPTime:     rtpTime,
+		PacketCount: packets,
+		OctetCount:  octets,
+	}
+
+	raw, err := sr.Marshal()
+	if err != nil {
+		p.logger.Warn("marshal audio RTCP SR", "error", err)
+		return
+	}
+
+	encrypted, err := p.audioSRTCPCtx.EncryptRTCP(nil, raw, nil)
+	if err != nil {
+		p.logger.Warn("encrypt audio SRTCP SR", "error", err)
+		return
+	}
+
+	if _, err := p.audioConn.WriteToUDP(encrypted, p.cameraAudioAddr); err != nil {
+		p.logger.Warn("send audio SRTCP SR to camera", "error", err)
+		return
+	}
+
+	p.logger.Debug("sent audio RTCP sender report",
+		"ssrc", p.audioReturnSSRC,
+		"rtp_ts", rtpTime,
+		"packets", packets,
+		"octets", octets)
+}
+
+func toNTPTime(t time.Time) uint64 {
+	const ntpEpochOffset = 2208988800
+	secs := uint64(t.Unix() + ntpEpochOffset)
+	frac := uint64(uint32((uint64(t.Nanosecond()) << 32) / 1e9))
+	return secs<<32 | frac
+}
+
+// SendAudioReturnPacket encrypts and sends an RTP audio packet to the HomeKit
+// camera return path. The packet payload must already be encoded in the codec
+// negotiated with the camera (usually AAC-ELD or Opus).
+func (p *SRTPProxy) SendAudioReturnPacket(pkt *rtp.Packet) {
+	if pkt == nil || len(pkt.Payload) == 0 {
+		return
+	}
+	if p.audioReturnCtx == nil || p.cameraAudioAddr == nil || p.audioConn == nil {
+		return
+	}
+
+	p.audioReturnMu.Lock()
+	now := time.Now()
+	if !p.audioReturnHaveInputTS || (!p.lastTalkbackPacket.IsZero() && now.Sub(p.lastTalkbackPacket) > 2*time.Second) {
+		p.audioReturnInputBaseTS = pkt.Header.Timestamp
+		p.audioReturnOutputBaseTS = p.audioReturnTS
+		p.audioReturnHaveInputTS = true
+	}
+	timestamp := p.audioReturnOutputBaseTS + (pkt.Header.Timestamp - p.audioReturnInputBaseTS)
+	p.audioReturnTS = timestamp
+	p.lastTalkbackPacket = now
+	p.talkbackPacketsSent++
+	sent := p.talkbackPacketsSent
+	p.audioReturnMu.Unlock()
+
+	if sent == 1 || sent%50 == 0 {
+		p.logger.Info("HomeKit talkback SRTP sent",
+			"packets", sent,
+			"payload", len(pkt.Payload),
+			"rtp_ts", timestamp,
+			"cameraAudioAddr", p.cameraAudioAddr)
+	}
+
+	p.sendAudioReturn(pkt.Payload, pkt.Header.Marker, timestamp)
+}
+
 // sendAudioReturn sends a single SRTP audio packet to the camera.
-func (p *SRTPProxy) sendAudioReturn(payload []byte) {
+func (p *SRTPProxy) sendAudioReturn(payload []byte, marker bool, timestamp uint32) {
+	p.audioReturnMu.Lock()
+	defer p.audioReturnMu.Unlock()
+
+	seq := p.audioReturnSeq
+	p.audioReturnSeq++
+	p.audioReturnPacketsSent++
+	p.audioReturnOctetsSent += uint32(len(payload))
+
 	pkt := rtp.Packet{
 		Header: rtp.Header{
 			Version:        2,
+			Marker:         marker,
 			PayloadType:    110,
-			SequenceNumber: p.audioReturnSeq,
-			Timestamp:      p.audioReturnTS,
+			SequenceNumber: seq,
+			Timestamp:      timestamp,
 			SSRC:           p.audioReturnSSRC,
 		},
 		Payload: payload,
 	}
-	p.audioReturnSeq++
-	p.audioReturnTS += 320
 
 	raw, err := pkt.Marshal()
 	if err != nil {
@@ -670,7 +831,9 @@ func (p *SRTPProxy) sendAudioReturn(payload []byte) {
 		return
 	}
 
-	p.audioConn.WriteToUDP(encrypted, p.cameraAudioAddr)
+	if _, err := p.audioConn.WriteToUDP(encrypted, p.cameraAudioAddr); err != nil {
+		p.logger.Warn("send audio return to camera", "error", err)
+	}
 }
 
 // Close stops the proxy and releases resources.

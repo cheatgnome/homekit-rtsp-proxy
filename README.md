@@ -33,7 +33,7 @@ HomeKit Camera                homekit-rtsp-proxy                 RTSP Clients
 1. Discovers HomeKit cameras via mDNS and pairs using the setup code
 2. When an RTSP client connects, negotiates an SRTP stream with the camera via HAP TLV8
 3. Receives encrypted SRTP packets, decrypts them, and forwards plain RTP to the RTSP client
-4. Sends RTCP keepalives and audio return silence packets to keep the camera streaming
+4. Sends RTCP keepalives and forwards RTSP talk-back audio to the camera, with low-rate silence keepalives as fallback
 5. Subscribes to the camera's motion sensor and relays events via an ONVIF PullPoint server
 
 ## Requirements
@@ -98,6 +98,7 @@ cameras:
       codec: "aac-eld"               # "aac-eld" or "opus"
       sample_rate: 16000
       gain: 512                      # PCM gain for transcoding (0 = passthrough, default 512 ≈ 54dB)
+      talkback_gain: 1               # PCM gain for talkback mic audio before AAC-ELD encoding
     onvif:
       enabled: true
       port: 8580
@@ -116,6 +117,8 @@ The `audio.gain` setting controls PCM amplification during AAC-ELD to AAC-LC tra
 | `1` - `1024` | Custom amplification. Higher values = louder. Output is hard-clipped at 16-bit range (±32767) |
 
 Set `gain: 0` if your camera's audio is already at normal levels, or if you don't need audio amplification.
+
+The `audio.talkback_gain` setting controls only RTSP backchannel microphone audio before it is sent back to the HomeKit camera. Leave it at `1` for unchanged input. If logs show `in_peak_pcm` staying near silence levels while you are speaking, try values such as `8`, `16`, or `32`; the `out_peak_pcm` log shows the amplified level after limiting. Repeated peaks near `32768` mean the mic audio is clipping and will sound distorted.
 
 ### Logging
 
@@ -266,7 +269,7 @@ go build -o test-rtsp ./cmd/test-rtsp/
 - **Single stream per camera:** Uses one of the camera's limited concurrent stream slots.
 - **No automatic stream recovery:** If the camera drops the SRTP stream, the RTSP client must reconnect.
 - **Audio gain may need tuning:** The default gain of 512 (~54dB) compensates for quiet AAC-ELD output on some cameras. Set `gain: 0` to disable amplification.
-- **No talkback:** Silence packets satisfy the protocol, but real two-way audio is not implemented.
+- **Talkback support:** ONVIF RTSP backchannel G.711 PCMU audio is transcoded to HomeKit AAC-ELD and forwarded to the camera return path. Opus talkback is forwarded as-is when Opus is configured.
 
 ## Tested Cameras
 

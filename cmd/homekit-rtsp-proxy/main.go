@@ -216,7 +216,14 @@ func main() {
 					audioConfig.SampleRate = hap.AudioSampleRate24kHz
 				default: // "aac-eld"
 					audioConfig.CodecType = hap.AudioCodecAACELD
-					audioConfig.SampleRate = hap.AudioSampleRate16kHz
+					switch cam.Audio.SampleRate {
+					case 8000:
+						audioConfig.SampleRate = hap.AudioSampleRate8kHz
+					case 24000:
+						audioConfig.SampleRate = hap.AudioSampleRate24kHz
+					default:
+						audioConfig.SampleRate = hap.AudioSampleRate16kHz
+					}
 				}
 
 				// Request stream from camera using the actual ports.
@@ -247,12 +254,12 @@ func main() {
 						IP:   resp.RemoteIP,
 						Port: int(resp.RemoteAudioPort),
 					},
-					ControllerVideoKey:   resp.ControllerVideoKey,
-					ControllerVideoSalt:  resp.ControllerVideoSalt,
-					ControllerVideoSSRC:  resp.ControllerVideoSSRC,
-					ControllerAudioKey:   resp.ControllerAudioKey,
-					ControllerAudioSalt:  resp.ControllerAudioSalt,
-					ControllerAudioSSRC:  resp.ControllerAudioSSRC,
+					ControllerVideoKey:  resp.ControllerVideoKey,
+					ControllerVideoSalt: resp.ControllerVideoSalt,
+					ControllerVideoSSRC: resp.ControllerVideoSSRC,
+					ControllerAudioKey:  resp.ControllerAudioKey,
+					ControllerAudioSalt: resp.ControllerAudioSalt,
+					ControllerAudioSSRC: resp.ControllerAudioSSRC,
 				}
 
 				return srtpProxy.Start(srtpCfg)
@@ -298,6 +305,8 @@ func main() {
 			AudioCodec:    cam.Audio.Codec,
 			SampleRate:    cam.Audio.SampleRate,
 			AudioGain:     *cam.Audio.Gain,
+			TalkbackGain:  *cam.Audio.TalkbackGain,
+			OnTalkbackRTP: srtpProxy.SendAudioReturnPacket,
 		}, session, camLogger)
 
 		// Wire SRTP proxy output to RTSP server.

@@ -118,6 +118,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 	"unsafe"
 )
 
@@ -125,23 +126,23 @@ import (
 // AAC-ELD uses 480 or 512 samples/frame; AAC-LC uses 1024. We accumulate
 // decoded PCM in a ring buffer and encode whenever we have a full LC frame.
 type AudioTranscoder struct {
-	gain int // PCM gain factor (0 = mute, 512 = ~54dB)
-	decoder C.HANDLE_AACDECODER
-	encoder C.HANDLE_AACENCODER
-	outASC  []byte  // AAC-LC AudioSpecificConfig from encoder
-	decBuf  []C.INT_PCM // temp buffer for one decoded ELD frame
-	pcmRing []C.INT_PCM // accumulator for PCM samples
-	pcmLen  int         // current number of valid samples in pcmRing
-	encBuf  []byte      // output buffer for encoder
-	encFrameSize int    // encoder's frame size (1024 for AAC-LC)
-	diagCount    int       // diagnostic counter
-	frameCount   int       // total frames decoded by production decoder
+	gain         int // PCM gain factor (0 = mute, 512 = ~54dB)
+	decoder      C.HANDLE_AACDECODER
+	encoder      C.HANDLE_AACENCODER
+	outASC       []byte      // AAC-LC AudioSpecificConfig from encoder
+	decBuf       []C.INT_PCM // temp buffer for one decoded ELD frame
+	pcmRing      []C.INT_PCM // accumulator for PCM samples
+	pcmLen       int         // current number of valid samples in pcmRing
+	encBuf       []byte      // output buffer for encoder
+	encFrameSize int         // encoder's frame size (1024 for AAC-LC)
+	diagCount    int         // diagnostic counter
+	frameCount   int         // total frames decoded by production decoder
 
 	// Auto-detection: try ASC candidates on first frames to find the right one.
 	ascCandidates []string
 	sampleRate    int
-	eldASCHex     string // the ASC we're currently using
-	detecting     bool   // true during auto-detection phase
+	eldASCHex     string   // the ASC we're currently using
+	detecting     bool     // true during auto-detection phase
 	detectFrames  [][]byte // buffered raw frames for detection
 }
 
@@ -290,7 +291,7 @@ func newTranscoderWithASC(sampleRate int, eldASCHex string) (*AudioTranscoder, e
 	}
 
 	// Allocate buffers.
-	t.decBuf = make([]C.INT_PCM, 8192)  // one decoded ELD frame (480-512 samples, room to spare)
+	t.decBuf = make([]C.INT_PCM, 8192)              // one decoded ELD frame (480-512 samples, room to spare)
 	t.pcmRing = make([]C.INT_PCM, t.encFrameSize*3) // accumulator (holds ~3 LC frames worth)
 	t.encBuf = make([]byte, 2048)
 
@@ -471,7 +472,6 @@ func (t *AudioTranscoder) transcodeFrame(aacELDFrame []byte) ([]byte, error) {
 		fmt.Printf("[audio_transcoder] frame=%d decoded=%d maxPCM=%d sizeof(INT_PCM)=%d\n",
 			t.frameCount, decoded, int(maxPCM), unsafe.Sizeof(t.decBuf[0]))
 	}
-
 
 	if t.pcmLen+decoded > len(t.pcmRing) {
 		return nil, fmt.Errorf("PCM ring overflow: %d + %d > %d", t.pcmLen, decoded, len(t.pcmRing))
@@ -727,12 +727,244 @@ func (t *AudioTranscoder) AudioSpecificConfigHex() string {
 	return strings.ToUpper(hex.EncodeToString(t.outASC))
 }
 
+// TalkbackTranscoder converts RTSP backchannel G.711 audio into HomeKit's
+// AAC-ELD RTP payload format.
+type TalkbackTranscoder struct {
+	encoder         C.HANDLE_AACENCODER
+	sampleRate      int
+	gain            int
+	encFrameSize    int
+	rtpFrameSamples int
+	pcmRing         []C.INT_PCM
+	pcmLen          int
+	encBuf          []byte
+	lastPCM         int16
+	haveLastPCM     bool
+}
+
+const talkbackPeakLimit = 22000
+
+func NewTalkbackTranscoder(sampleRate int, gain int) (*TalkbackTranscoder, error) {
+	if sampleRate == 0 {
+		sampleRate = 16000
+	}
+	if gain < 1 {
+		gain = 1
+	}
+	if sampleRate%8000 != 0 {
+		return nil, fmt.Errorf("talkback sample rate %d is not an integer multiple of 8000", sampleRate)
+	}
+
+	var encoder C.HANDLE_AACENCODER
+	if e := C.aacEncOpen(&encoder, 0, 1); e != C.AACENC_OK {
+		return nil, fmt.Errorf("aacEncOpen talkback failed: %d", e)
+	}
+
+	targetFrameSamples := 480
+
+	t := &TalkbackTranscoder{
+		encoder:         encoder,
+		sampleRate:      sampleRate,
+		gain:            gain,
+		rtpFrameSamples: targetFrameSamples,
+		encBuf:          make([]byte, 2048),
+	}
+
+	params := []struct {
+		param C.AACENC_PARAM
+		value int
+	}{
+		{C.AACENC_AOT, C.AOT_ER_AAC_ELD},
+		{C.AACENC_SAMPLERATE, sampleRate},
+		{C.AACENC_CHANNELMODE, C.MODE_1},
+		{C.AACENC_BITRATE, 24000},
+		// HomeKit negotiates AAC-ELD at 30 ms packet time. At 16 kHz that is
+		// 480 samples, so use FDK's short ELD frame mode instead of the 512
+		// sample default.
+		{C.AACENC_GRANULE_LENGTH, targetFrameSamples},
+		{C.AACENC_TRANSMUX, C.TT_MP4_RAW},
+	}
+	for _, p := range params {
+		if e := C.aacEncoder_SetParam(t.encoder, p.param, C.UINT(p.value)); e != C.AACENC_OK {
+			t.Close()
+			return nil, fmt.Errorf("aacEncoder_SetParam talkback(%d) failed: %d", p.param, e)
+		}
+	}
+
+	if e := C.aacEncEncode(t.encoder, nil, nil, nil, nil); e != C.AACENC_OK {
+		t.Close()
+		return nil, fmt.Errorf("aacEncEncode talkback init failed: %d", e)
+	}
+
+	var info C.AACENC_InfoStruct
+	if e := C.aacEncInfo(t.encoder, &info); e != C.AACENC_OK {
+		t.Close()
+		return nil, fmt.Errorf("aacEncInfo talkback failed: %d", e)
+	}
+
+	t.encFrameSize = int(info.frameLength)
+	t.rtpFrameSamples = t.encFrameSize
+	t.pcmRing = make([]C.INT_PCM, t.encFrameSize*4)
+	return t, nil
+}
+
+func (t *TalkbackTranscoder) FrameDuration() time.Duration {
+	if t == nil || t.sampleRate <= 0 || t.rtpFrameSamples <= 0 {
+		return 30 * time.Millisecond
+	}
+	return time.Duration(t.rtpFrameSamples) * time.Second / time.Duration(t.sampleRate)
+}
+
+func (t *TalkbackTranscoder) TranscodeG711(payload []byte, mulaw bool) ([][]byte, int, int, error) {
+	if len(payload) == 0 {
+		return nil, 0, 0, nil
+	}
+
+	inPeak := 0
+	decoded := make([]int16, len(payload))
+	for i, b := range payload {
+		pcm := decodeG711Sample(b, mulaw)
+		decoded[i] = pcm
+		if v := absInt16(pcm); v > inPeak {
+			inPeak = v
+		}
+	}
+
+	gainNumer, gainDenom := t.gain, 1
+	if inPeak > 0 && int64(inPeak)*int64(t.gain) > talkbackPeakLimit {
+		gainNumer = talkbackPeakLimit
+		gainDenom = inPeak
+	}
+
+	upsample := t.sampleRate / 8000
+	outPeak := 0
+	for _, pcm := range decoded {
+		pcm = scaleInt16(pcm, gainNumer, gainDenom)
+		if v := absInt16(pcm); v > outPeak {
+			outPeak = v
+		}
+		if !t.haveLastPCM {
+			t.lastPCM = pcm
+			t.haveLastPCM = true
+		}
+		for i := 1; i <= upsample; i++ {
+			t.appendTalkbackPCM(interpolateInt16(t.lastPCM, pcm, i, upsample))
+		}
+		t.lastPCM = pcm
+	}
+
+	var out [][]byte
+	for t.pcmLen >= t.encFrameSize {
+		n := C.encode_frame(t.encoder, &t.pcmRing[0], C.int(t.encFrameSize),
+			(*C.uchar)(unsafe.Pointer(&t.encBuf[0])), C.int(len(t.encBuf)))
+		if n < 0 {
+			return nil, inPeak, outPeak, fmt.Errorf("AAC-ELD talkback encode failed: %d", n)
+		}
+		if n > 0 {
+			payload := make([]byte, 4+int(n))
+			binary.BigEndian.PutUint16(payload[0:2], 16)
+			binary.BigEndian.PutUint16(payload[2:4], uint16(n)<<3)
+			copy(payload[4:], t.encBuf[:int(n)])
+			out = append(out, payload)
+		}
+
+		copy(t.pcmRing, t.pcmRing[t.encFrameSize:t.pcmLen])
+		t.pcmLen -= t.encFrameSize
+	}
+
+	return out, inPeak, outPeak, nil
+}
+
+func (t *TalkbackTranscoder) appendTalkbackPCM(pcm int16) {
+	if t.pcmLen >= len(t.pcmRing) {
+		copy(t.pcmRing, t.pcmRing[t.encFrameSize:t.pcmLen])
+		t.pcmLen -= t.encFrameSize
+	}
+	t.pcmRing[t.pcmLen] = C.INT_PCM(pcm)
+	t.pcmLen++
+}
+
+func interpolateInt16(from int16, to int16, step int, steps int) int16 {
+	if steps <= 1 {
+		return to
+	}
+	v := int(from) + (int(to)-int(from))*step/steps
+	return int16(v)
+}
+
+func scaleInt16(v int16, numer int, denom int) int16 {
+	if denom <= 0 {
+		denom = 1
+	}
+	if numer == denom {
+		return v
+	}
+	scaled := int64(v) * int64(numer) / int64(denom)
+	return clipInt16(scaled)
+}
+
+func clipInt16(v int64) int16 {
+	if v > 32767 {
+		return 32767
+	}
+	if v < -32768 {
+		return -32768
+	}
+	return int16(v)
+}
+
+func absInt16(v int16) int {
+	n := int(v)
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func decodeG711Sample(v byte, mulaw bool) int16 {
+	if mulaw {
+		u := ^v
+		sign := u & 0x80
+		exponent := (u >> 4) & 0x07
+		mantissa := u & 0x0F
+		sample := int(((uint16(mantissa) << 3) + 0x84) << exponent)
+		sample -= 0x84
+		if sign != 0 {
+			return int16(-sample)
+		}
+		return int16(sample)
+	}
+
+	a := v ^ 0x55
+	sign := a & 0x80
+	exponent := (a >> 4) & 0x07
+	mantissa := a & 0x0F
+	sample := int(mantissa) << 4
+	if exponent == 0 {
+		sample += 8
+	} else {
+		sample += 0x108
+		sample <<= exponent - 1
+	}
+	if sign == 0 {
+		return int16(-sample)
+	}
+	return int16(sample)
+}
+
 // Close releases all FDK-AAC resources.
 func (t *AudioTranscoder) Close() {
 	if t.decoder != nil {
 		C.aacDecoder_Close(t.decoder)
 		t.decoder = nil
 	}
+	if t.encoder != nil {
+		C.aacEncClose(&t.encoder)
+		t.encoder = nil
+	}
+}
+
+func (t *TalkbackTranscoder) Close() {
 	if t.encoder != nil {
 		C.aacEncClose(&t.encoder)
 		t.encoder = nil
