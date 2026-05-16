@@ -742,6 +742,12 @@ type TalkbackTranscoder struct {
 	haveLastPCM     bool
 }
 
+type TalkbackFrame struct {
+	Payload []byte
+	Samples uint32
+	Padded  bool
+}
+
 const talkbackPeakLimit = 22000
 
 func NewTalkbackTranscoder(sampleRate int, gain int) (*TalkbackTranscoder, error) {
@@ -760,7 +766,7 @@ func NewTalkbackTranscoder(sampleRate int, gain int) (*TalkbackTranscoder, error
 		return nil, fmt.Errorf("aacEncOpen talkback failed: %d", e)
 	}
 
-	targetFrameSamples := 480
+	targetFrameSamples := 512
 
 	t := &TalkbackTranscoder{
 		encoder:         encoder,
@@ -778,9 +784,9 @@ func NewTalkbackTranscoder(sampleRate int, gain int) (*TalkbackTranscoder, error
 		{C.AACENC_SAMPLERATE, sampleRate},
 		{C.AACENC_CHANNELMODE, C.MODE_1},
 		{C.AACENC_BITRATE, 24000},
-		// HomeKit negotiates AAC-ELD at 30 ms packet time. At 16 kHz that is
-		// 480 samples, so use FDK's short ELD frame mode instead of the 512
-		// sample default.
+		// The G100's camera-to-controller AAC-ELD stream decodes to 512-sample
+		// frames, and the return path sounds time-stretched when forced to
+		// short 480-sample frames. Use the native ELD frame cadence here too.
 		{C.AACENC_GRANULE_LENGTH, targetFrameSamples},
 		{C.AACENC_TRANSMUX, C.TT_MP4_RAW},
 	}
@@ -805,6 +811,12 @@ func NewTalkbackTranscoder(sampleRate int, gain int) (*TalkbackTranscoder, error
 	t.encFrameSize = int(info.frameLength)
 	t.rtpFrameSamples = t.encFrameSize
 	t.pcmRing = make([]C.INT_PCM, t.encFrameSize*4)
+	silence := make([]C.INT_PCM, t.encFrameSize)
+	if n := C.encode_frame(t.encoder, &silence[0], C.int(t.encFrameSize),
+		(*C.uchar)(unsafe.Pointer(&t.encBuf[0])), C.int(len(t.encBuf))); n < 0 {
+		t.Close()
+		return nil, fmt.Errorf("AAC-ELD talkback encoder priming failed: %d", n)
+	}
 	return t, nil
 }
 
@@ -815,7 +827,17 @@ func (t *TalkbackTranscoder) FrameDuration() time.Duration {
 	return time.Duration(t.rtpFrameSamples) * time.Second / time.Duration(t.sampleRate)
 }
 
-func (t *TalkbackTranscoder) TranscodeG711(payload []byte, mulaw bool) ([][]byte, int, int, error) {
+func (t *TalkbackTranscoder) FrameDurationForSamples(samples uint32) time.Duration {
+	if t == nil || t.sampleRate <= 0 {
+		return 30 * time.Millisecond
+	}
+	if samples == 0 {
+		samples = uint32(t.rtpFrameSamples)
+	}
+	return time.Duration(samples) * time.Second / time.Duration(t.sampleRate)
+}
+
+func (t *TalkbackTranscoder) TranscodeG711(payload []byte, mulaw bool) ([]TalkbackFrame, int, int, error) {
 	if len(payload) == 0 {
 		return nil, 0, 0, nil
 	}
@@ -853,7 +875,7 @@ func (t *TalkbackTranscoder) TranscodeG711(payload []byte, mulaw bool) ([][]byte
 		t.lastPCM = pcm
 	}
 
-	var out [][]byte
+	var out []TalkbackFrame
 	for t.pcmLen >= t.encFrameSize {
 		n := C.encode_frame(t.encoder, &t.pcmRing[0], C.int(t.encFrameSize),
 			(*C.uchar)(unsafe.Pointer(&t.encBuf[0])), C.int(len(t.encBuf)))
@@ -865,13 +887,16 @@ func (t *TalkbackTranscoder) TranscodeG711(payload []byte, mulaw bool) ([][]byte
 			binary.BigEndian.PutUint16(payload[0:2], 16)
 			binary.BigEndian.PutUint16(payload[2:4], uint16(n)<<3)
 			copy(payload[4:], t.encBuf[:int(n)])
-			out = append(out, payload)
+			out = append(out, TalkbackFrame{Payload: payload})
 		}
 
 		copy(t.pcmRing, t.pcmRing[t.encFrameSize:t.pcmLen])
 		t.pcmLen -= t.encFrameSize
 	}
 
+	for i := range out {
+		out[i].Samples = uint32(t.encFrameSize)
+	}
 	return out, inPeak, outPeak, nil
 }
 

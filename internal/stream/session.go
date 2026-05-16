@@ -12,7 +12,7 @@ import (
 type SessionState int
 
 const (
-	StateIdle     SessionState = iota
+	StateIdle SessionState = iota
 	StateStarting
 	StateStreaming
 	StateStopping

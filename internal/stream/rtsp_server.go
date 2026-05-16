@@ -61,7 +61,7 @@ type RTSPServer struct {
 	transcoder          *AudioTranscoder
 	audioSeq            uint16 // monotonic audio seq counter (transcoding changes packet count)
 	talkbackTranscoder  *TalkbackTranscoder
-	talkbackQueue       chan []byte
+	talkbackQueue       chan TalkbackFrame
 	talkbackStop        chan struct{}
 	talkbackStopOnce    sync.Once
 	talkbackWG          sync.WaitGroup
@@ -213,9 +213,10 @@ func NewRTSPServer(cfg RTSPServerConfig, session *Session, logger *slog.Logger) 
 					"gain", talkbackTranscoder.gain,
 					"encoderFrameSamples", talkbackTranscoder.encFrameSize,
 					"rtpFrameSamples", talkbackTranscoder.rtpFrameSamples,
-					"packetTime", talkbackTranscoder.FrameDuration())
+					"packetTime", talkbackTranscoder.FrameDuration(),
+					"encoderPrimed", true)
 				if cfg.OnTalkbackRTP != nil {
-					s.talkbackQueue = make(chan []byte, 200)
+					s.talkbackQueue = make(chan TalkbackFrame, 200)
 					s.talkbackStop = make(chan struct{})
 				}
 			}
@@ -607,39 +608,39 @@ func (s *RTSPServer) WriteAudioPacket(pkt *rtp.Packet) {
 func (s *RTSPServer) talkbackSenderLoop() {
 	defer s.talkbackWG.Done()
 
-	frameDuration := s.talkbackTranscoder.FrameDuration()
-	if frameDuration <= 0 {
-		frameDuration = 30 * time.Millisecond
-	}
-	ticker := time.NewTicker(frameDuration)
-	defer ticker.Stop()
-
 	s.logger.Info("talkback RTP pacer started",
-		"packetTime", frameDuration,
+		"defaultPacketTime", s.talkbackTranscoder.FrameDuration(),
 		"rtpFrameSamples", s.talkbackTranscoder.rtpFrameSamples)
 
 	for {
 		select {
 		case <-s.talkbackStop:
 			return
-		case <-ticker.C:
+		case frame := <-s.talkbackQueue:
+			s.sendTalkbackPayload(frame)
+			delay := s.talkbackTranscoder.FrameDurationForSamples(frame.Samples)
+			if delay <= 0 {
+				delay = 30 * time.Millisecond
+			}
+			timer := time.NewTimer(delay)
 			select {
-			case payload := <-s.talkbackQueue:
-				s.sendTalkbackPayload(payload)
-			default:
+			case <-s.talkbackStop:
+				timer.Stop()
+				return
+			case <-timer.C:
 			}
 		}
 	}
 }
 
-func (s *RTSPServer) enqueueTalkbackPayload(payload []byte) {
+func (s *RTSPServer) enqueueTalkbackFrame(frame TalkbackFrame) {
 	if s.talkbackQueue == nil {
-		s.sendTalkbackPayload(payload)
+		s.sendTalkbackPayload(frame)
 		return
 	}
 
 	select {
-	case s.talkbackQueue <- payload:
+	case s.talkbackQueue <- frame:
 		return
 	default:
 	}
@@ -650,14 +651,18 @@ func (s *RTSPServer) enqueueTalkbackPayload(payload []byte) {
 	default:
 	}
 	select {
-	case s.talkbackQueue <- payload:
+	case s.talkbackQueue <- frame:
 	default:
 	}
 }
 
-func (s *RTSPServer) sendTalkbackPayload(payload []byte) {
+func (s *RTSPServer) sendTalkbackPayload(frame TalkbackFrame) {
 	if s.onTalkbackRTP == nil || s.talkbackTranscoder == nil {
 		return
+	}
+	samples := frame.Samples
+	if samples == 0 {
+		samples = uint32(s.talkbackTranscoder.rtpFrameSamples)
 	}
 
 	out := &rtp.Packet{
@@ -668,10 +673,10 @@ func (s *RTSPServer) sendTalkbackPayload(payload []byte) {
 			SequenceNumber: s.talkbackSeq,
 			Timestamp:      s.talkbackTS,
 		},
-		Payload: payload,
+		Payload: frame.Payload,
 	}
 	s.talkbackSeq++
-	s.talkbackTS += uint32(s.talkbackTranscoder.rtpFrameSamples)
+	s.talkbackTS += samples
 	s.onTalkbackRTP(out)
 }
 
@@ -1019,22 +1024,31 @@ func (s *RTSPServer) handleTalkbackPacket(forma format.Format, pkt *rtp.Packet) 
 	count := s.talkbackPacketCount
 
 	if g711, ok := forma.(*format.G711); ok && s.talkbackTranscoder != nil {
-		payloads, inPeakPCM, outPeakPCM, err := s.talkbackTranscoder.TranscodeG711(pkt.Payload, g711.MULaw)
+		frames, inPeakPCM, outPeakPCM, err := s.talkbackTranscoder.TranscodeG711(pkt.Payload, g711.MULaw)
 		if err != nil {
 			s.logger.Warn("talkback transcode error", "error", err)
 			return
 		}
-		for _, payload := range payloads {
-			s.enqueueTalkbackPayload(payload)
+		for _, frame := range frames {
+			s.enqueueTalkbackFrame(frame)
 		}
 		if count == 1 || count%50 == 0 {
-			expectedFrames := len(pkt.Payload) * s.talkbackTranscoder.sampleRate / 8000 / s.talkbackTranscoder.encFrameSize
+			inputSamples := len(pkt.Payload) * s.talkbackTranscoder.sampleRate / 8000
+			expectedFrames := inputSamples / s.talkbackTranscoder.encFrameSize
+			outFrameSamples := 0
+			if len(frames) > 0 {
+				outFrameSamples = int(frames[0].Samples)
+			}
 			s.logger.Info("RTSP talkback RTP received",
 				"packets", count,
 				"codec", forma.Codec(),
 				"in_payload", len(pkt.Payload),
-				"out_frames", len(payloads),
+				"out_frames", len(frames),
 				"expected_frames", expectedFrames,
+				"out_frame_samples", outFrameSamples,
+				"sample_rate", s.talkbackTranscoder.sampleRate,
+				"input_samples", inputSamples,
+				"pending_samples", s.talkbackTranscoder.pcmLen,
 				"in_peak_pcm", inPeakPCM,
 				"out_peak_pcm", outPeakPCM,
 				"gain", s.talkbackTranscoder.gain,
